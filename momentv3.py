@@ -527,7 +527,7 @@ def main():
     """)
 
     st.sidebar.header("1. Universo e Dados")
-    default_univ = "ITUB4, VALE3, WEGE3, PRIO3, BBAS3, PETR4, RENT3, B3SA3, EQTL3, LREN3, RADL3, RAIL3, SUZB3, JBSS3, VIVT3, CMIG4, ELET3, BBSE3, GOAU4, TOTS3, MDIA3"
+    default_univ = "ITUB3, TOTS3, MDIA3, TAEE3, BBSE3, WEGE3, PSSA3, EGIE3, B3SA3, VIVT3, AGRO3, PRIO3, BBAS3, BPAC11, SBSP3, SAPR4, CMIG3, UNIP6, FRAS3, CPFE3"
     ticker_input = st.sidebar.text_area("Tickers (Brapi Format - Sem .SA)", default_univ, height=100)
     raw_tickers = [t.strip().upper() for t in ticker_input.split(',') if t.strip()]
     yf_tickers = [f"{t}.SA" for t in raw_tickers]
