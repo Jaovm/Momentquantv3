@@ -1,0 +1,10 @@
+streamlit
+pandas
+numpy
+yfinance
+statsmodels
+plotly
+scipy
+pytest
+matplotlib  # <<-- Adicionado
+fundamentus
