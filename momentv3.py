@@ -1,24 +1,25 @@
 """
-ValuationB3 — Motor de DCF Fundamentalista para o Mercado Brasileiro (B3)
-=========================================================================
-Desenvolvido para Streamlit Cloud | v1.0
-Arquitetura: Modular, PEP-8, @st.cache_data, st.session_state
+==============================================================================
+Valuation B3 — DCF Engine Pro
+Motor de Valuation Fundamentalista para Ações da B3
+Desenvolvido para deploy no Streamlit Cloud
 
 Pilares:
-  1. Diagnóstico do Cenário Atual   (Aba 1)
-  2. Premissas de Projeção          (Aba 2)
-  3. Motor DCF (FCFF / FCFE)        (Aba 3)
-  4. Output Financeiro e Decisão    (Aba 4)
-  5. Análise de Sensibilidade       (Aba 5)
+  1. Diagnóstico do Cenário Atual (Aba 1)
+  2. Premissas de Projeção (Aba 2)
+  3. Motor FCFF / FCFE (Aba 3)
+  4. Output Financeiro & Decisão (Aba 3 - métricas)
+  5. Estresse de Modelo / Sensibilidade (Aba 4)
+==============================================================================
 """
 
-from __future__ import annotations
-
 import warnings
-from typing import Any, Dict, List, Optional
+import io
+import time
 
 import numpy as np
 import pandas as pd
+import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
@@ -27,1762 +28,1534 @@ from scipy.optimize import brentq
 
 warnings.filterwarnings("ignore")
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# CONSTANTES
-# ──────────────────────────────────────────────────────────────────────────────
-
-SGS_BASE = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.{}/dados/ultimos/{}?formato=json"
-SGS_IPCA = 433        # IPCA mensal
-SGS_CDI = 4391        # CDI acumulado 12 meses
-SGS_SELIC = 432       # Meta SELIC anualizada
-
-FALLBACK_IPCA = 0.045
-FALLBACK_CDI = 0.107
-FALLBACK_SELIC = 0.105
-FALLBACK_PIB_NOMINAL = 0.085   # IPCA + crescimento real estimado
-PIB_REAL_ESTIMATE = 0.020      # crescimento real estimado do PIB
-
-CHART_BG = "#0F172A"
-CHART_PAPER = "#0F172A"
-CHART_FONT = "#E2E8F0"
-
-# ──────────────────────────────────────────────────────────────────────────────
+# ==============================================================================
 # CONFIGURAÇÃO DA PÁGINA
-# ──────────────────────────────────────────────────────────────────────────────
-
+# ==============================================================================
 st.set_page_config(
-    page_title="ValuationB3 | DCF Engine",
+    page_title="Valuation B3 | DCF Engine Pro",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-_CSS = """
-<style>
-  [data-testid="stSidebar"]        { background:#0F172A; }
-  .stMetricValue                   { font-size:1.35rem !important; font-weight:700; }
-  .stMetricLabel                   { font-size:.78rem !important; color:#94A3B8; }
-  .stTabs [data-baseweb="tab"]     { background:#1E293B; border-radius:8px;
-                                     padding:8px 18px; color:#94A3B8; }
-  .stTabs [aria-selected="true"]   { background:#3B82F6 !important; color:#fff !important; }
-  div[data-testid="stExpander"]    { border:1px solid #1E293B; border-radius:8px; }
-</style>
+# ==============================================================================
+# CONSTANTES
+# ==============================================================================
+BCB_SGS_URL = (
+    "https://api.bcb.gov.br/dados/serie/"
+    "bcdata.sgs.{code}/dados/ultimos/{n}?formato=json"
+)
+# Séries SGS Banco Central do Brasil
+SERIES_IPCA_ACUM_12M = 13522   # IPCA acumulado 12 meses
+SERIES_DI_OVER = 11            # DI over diário (base 252)
+SERIES_SELIC_META = 432        # Meta Selic
+SERIES_PIB_REAL = 7326         # Expectativa PIB real (Focus)
+
+DEFAULT_TICKERS = [
+    "WEGE3", "ITUB3", "BBAS3", "PETR4", "VALE3",
+    "RENT3", "EGIE3", "BBSE3", "PRIO3", "TOTS3",
+    "MDIA3", "TAEE3", "B3SA3", "VIVT3", "AGRO3",
+]
+
+CSV_TEMPLATE_HELP = """
+**Formato do CSV esperado** (valores em R$ bilhões):
+
+| Date       | Revenue | EBITDA | EBIT | DA   | Capex | Net_Debt | NWC  | Net_Income |
+|------------|---------|--------|------|------|-------|----------|------|------------|
+| 2024-09-30 | 3.5     | 1.05   | 0.9  | 0.15 | 0.35  | 2.1      | 0.8  | 0.65       |
+| 2024-06-30 | 3.2     | 0.96   | 0.82 | 0.14 | 0.32  | 2.0      | 0.75 | 0.60       |
+
+Inclua ao menos 4 linhas (1 ano = 4 trimestres).
 """
-st.markdown(_CSS, unsafe_allow_html=True)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# SESSION STATE
-# ──────────────────────────────────────────────────────────────────────────────
-
-_STATE_DEFAULTS: Dict[str, Any] = {
-    "ticker_loaded": False,
-    "ticker_yf": "",
-    "quarterly_df": pd.DataFrame(),
-    "macro": {},
-    "current_price": np.nan,
-    "shares_outstanding": np.nan,
-    "net_debt_ss": np.nan,
-    "last_ebitda": np.nan,
-    "last_ebit": np.nan,
-    "last_revenue": np.nan,
-    "last_da": np.nan,
-    "last_capex": np.nan,
-    "last_nwc": 0.0,
-    "dcf_results": {},
-    "premissas_inputs": {},
-}
-
-
-def _init_state() -> None:
-    """Inicializa session_state com valores padrão se ausentes."""
-    for key, val in _STATE_DEFAULTS.items():
-        if key not in st.session_state:
-            st.session_state[key] = val
-
-
-def _reset_state() -> None:
-    """Reinicia estado ao trocar de ticker."""
-    for key, val in _STATE_DEFAULTS.items():
-        st.session_state[key] = val
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# MÓDULO 1 — DATA FETCHING
-# ──────────────────────────────────────────────────────────────────────────────
+# ==============================================================================
+# MÓDULO 1: MACRO — API SGS BANCO CENTRAL DO BRASIL
+# ==============================================================================
 
 @st.cache_data(ttl=3600 * 6, show_spinner=False)
-def _sgs(series_id: int, n: int = 12) -> pd.DataFrame:
-    """Consome a API do SGS do Banco Central do Brasil."""
+def fetch_bcb_series(serie_code: int, n_periodos: int = 24) -> pd.DataFrame:
+    """
+    Busca série temporal no SGS do Banco Central do Brasil.
+
+    Args:
+        serie_code: Código da série no SGS.
+        n_periodos: Número de períodos a retornar.
+
+    Returns:
+        DataFrame com colunas ['data', 'valor'] ou vazio em caso de falha.
+    """
+    url = BCB_SGS_URL.format(code=serie_code, n=n_periodos)
     try:
-        resp = requests.get(SGS_BASE.format(series_id, n), timeout=12)
+        resp = requests.get(url, timeout=15)
         resp.raise_for_status()
         df = pd.DataFrame(resp.json())
-        df["data"] = pd.to_datetime(df["data"], format="%d/%m/%Y")
+        if df.empty:
+            return pd.DataFrame(columns=["data", "valor"])
+        df["data"] = pd.to_datetime(df["data"], dayfirst=True)
         df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
-        return df
-    except Exception as exc:  # noqa: BLE001
-        st.toast(f"⚠️ SGS série {series_id}: {exc}", icon="⚠️")
+        return df.sort_values("data").reset_index(drop=True)
+    except Exception as exc:
+        st.warning(f"⚠️ SGS BCB indisponível (série {serie_code}): {exc}")
         return pd.DataFrame(columns=["data", "valor"])
 
 
 @st.cache_data(ttl=3600 * 6, show_spinner=False)
-def fetch_macro() -> Dict[str, float]:
+def get_macro_indicators() -> dict:
     """
-    Retorna dict com indicadores macroeconômicos atuais via SGS/BCB.
-    Fallbacks automáticos se a API falhar.
+    Retorna IPCA 12m, DI anual, Selic meta e estimativa de PIB nominal.
+
+    Returns:
+        dict com chaves: ipca_12m, di_anual, selic, pib_nominal (valores decimais).
     """
-    macro: Dict[str, float] = {}
+    indicators: dict = {}
 
-    # IPCA — acumulado 12 meses
-    df_ipca = _sgs(SGS_IPCA, 12)
-    if not df_ipca.empty and df_ipca["valor"].notna().any():
-        macro["ipca_12m"] = float((1 + df_ipca["valor"].dropna() / 100).prod() - 1)
+    # IPCA acumulado 12 meses
+    df_ipca = fetch_bcb_series(SERIES_IPCA_ACUM_12M, n_periodos=2)
+    indicators["ipca_12m"] = (
+        float(df_ipca["valor"].iloc[-1]) / 100
+        if not df_ipca.empty
+        else 0.045
+    )
+
+    # DI over diário → anualizado (base 252)
+    df_di = fetch_bcb_series(SERIES_DI_OVER, n_periodos=5)
+    if not df_di.empty:
+        di_daily_pct = float(df_di["valor"].iloc[-1]) / 100
+        indicators["di_anual"] = (1 + di_daily_pct / 252) ** 252 - 1
     else:
-        macro["ipca_12m"] = FALLBACK_IPCA
+        indicators["di_anual"] = 0.135
 
-    # CDI anual
-    df_cdi = _sgs(SGS_CDI, 1)
-    if not df_cdi.empty and df_cdi["valor"].notna().any():
-        macro["cdi_anual"] = float(df_cdi["valor"].dropna().iloc[-1] / 100)
-    else:
-        macro["cdi_anual"] = FALLBACK_CDI
+    # Meta Selic (% a.a.)
+    df_selic = fetch_bcb_series(SERIES_SELIC_META, n_periodos=2)
+    indicators["selic"] = (
+        float(df_selic["valor"].iloc[-1]) / 100
+        if not df_selic.empty
+        else 0.135
+    )
 
-    # SELIC meta
-    df_selic = _sgs(SGS_SELIC, 1)
-    if not df_selic.empty and df_selic["valor"].notna().any():
-        macro["selic"] = float(df_selic["valor"].dropna().iloc[-1] / 100)
-    else:
-        macro["selic"] = FALLBACK_SELIC
+    # PIB Nominal estimado = IPCA + crescimento real assumido de 2%
+    indicators["pib_nominal"] = indicators["ipca_12m"] + 0.02
 
-    # PIB nominal estimado = IPCA + crescimento real
-    macro["pib_nominal"] = macro["ipca_12m"] + PIB_REAL_ESTIMATE
-
-    return macro
+    return indicators
 
 
-@st.cache_data(ttl=3600 * 12, show_spinner=False)
-def fetch_info(ticker_yf: str) -> Dict[str, Any]:
-    """Busca metadados do ativo via yfinance."""
+# ==============================================================================
+# MÓDULO 2: DADOS FINANCEIROS — YFINANCE
+# ==============================================================================
+
+@st.cache_data(ttl=3600 * 8, show_spinner=False)
+def fetch_quarterly_financials(ticker_sa: str) -> dict:
+    """
+    Extrai demonstrativos financeiros trimestrais via yfinance.
+
+    Args:
+        ticker_sa: Ticker no formato yfinance, ex: 'WEGE3.SA'.
+
+    Returns:
+        dict com DataFrames: income, balance, cashflow, info.
+    """
+    empty = {
+        "income": pd.DataFrame(),
+        "balance": pd.DataFrame(),
+        "cashflow": pd.DataFrame(),
+        "info": {},
+        "ticker": ticker_sa,
+    }
     try:
-        return yf.Ticker(ticker_yf).info or {}
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"Erro ao buscar info de {ticker_yf}: {exc}")
-        return {}
+        t = yf.Ticker(ticker_sa)
+        income = t.quarterly_financials.T
+        balance = t.quarterly_balance_sheet.T
+        cashflow = t.quarterly_cashflow.T
+        info = t.info or {}
+        return {
+            "income": income,
+            "balance": balance,
+            "cashflow": cashflow,
+            "info": info,
+            "ticker": ticker_sa,
+        }
+    except Exception as exc:
+        st.warning(f"⚠️ Erro ao buscar demonstrativos de {ticker_sa}: {exc}")
+        return empty
 
 
-@st.cache_data(ttl=3600 * 12, show_spinner=False)
-def fetch_quarterly(ticker_yf: str) -> pd.DataFrame:
+def _get_col(df: pd.DataFrame, candidates: list) -> pd.Series:
+    """Busca a primeira coluna que contenha um dos nomes candidatos."""
+    for c in candidates:
+        matches = [col for col in df.columns if c.lower() in str(col).lower()]
+        if matches:
+            return df[matches[0]]
+    return pd.Series(dtype=float)
+
+
+def parse_financial_quarterly(data: dict) -> pd.DataFrame:
     """
-    Extrai até 12 trimestres de dados financeiros consolidados:
-    Revenue, EBIT, EBITDA, D&A, Capex, NetDebt, NWC.
+    Processa demonstrativos financeiros e extrai métricas por trimestre.
 
-    Fontes: quarterly_financials, quarterly_balance_sheet, quarterly_cashflow
-    via yfinance.  Retorna DataFrame ordenado do mais antigo ao mais recente.
+    Returns:
+        DataFrame com colunas: Revenue, EBITDA, EBIT, DA, Capex,
+        Net_Debt, NWC, Net_Income, Net_Borrowing (em R$ bilhões).
+        Índice: DatetimeIndex, ordenado do mais recente ao mais antigo.
     """
-    def _get(df: pd.DataFrame, keys: List[str], col: Any) -> float:
-        """Busca segura em DataFrame transposto do yfinance."""
-        for k in keys:
-            try:
-                if k in df.index and col in df.columns:
-                    v = df.loc[k, col]
-                    if pd.notna(v):
-                        return float(v)
-            except Exception:
-                continue
-        return np.nan
+    income = data.get("income", pd.DataFrame())
+    balance = data.get("balance", pd.DataFrame())
+    cashflow = data.get("cashflow", pd.DataFrame())
 
-    try:
-        t = yf.Ticker(ticker_yf)
-        fin = t.quarterly_financials
-        bs = t.quarterly_balance_sheet
-        cf = t.quarterly_cashflow
-
-        if fin is None or fin.empty:
-            return pd.DataFrame()
-
-        dates = fin.columns.tolist()[:12]
-        rows: List[Dict[str, Any]] = []
-
-        for d in dates:
-            row: Dict[str, Any] = {"Date": d}
-
-            # ── DRE ──────────────────────────────────────────────────────────
-            row["Revenue"] = _get(fin, [
-                "Total Revenue", "Revenue", "Net Revenue",
-            ], d)
-            row["EBIT"] = _get(fin, [
-                "EBIT", "Operating Income",
-            ], d)
-            row["Net_Income"] = _get(fin, [
-                "Net Income", "Net Income Common Stockholders",
-            ], d)
-
-            # ── FLUXO DE CAIXA ────────────────────────────────────────────
-            row["DA"] = _get(cf, [
-                "Depreciation And Amortization",
-                "Depreciation Amortization Depletion",
-                "Depreciation",
-            ], d)
-            if np.isnan(row["DA"]):
-                row["DA"] = _get(fin, [
-                    "Reconciled Depreciation", "Depreciation",
-                ], d)
-
-            raw_capex = _get(cf, [
-                "Capital Expenditure",
-                "Purchase Of PPE",
-                "Capital Expenditures",
-            ], d)
-            row["Capex"] = abs(raw_capex) if not np.isnan(raw_capex) else np.nan
-
-            # ── EBITDA ───────────────────────────────────────────────────────
-            if not np.isnan(row["EBIT"]) and not np.isnan(row["DA"]):
-                row["EBITDA"] = row["EBIT"] + abs(row["DA"])
-            else:
-                row["EBITDA"] = _get(fin, ["EBITDA", "Normalized EBITDA"], d)
-
-            # ── BALANÇO ───────────────────────────────────────────────────
-            total_debt = _get(bs, [
-                "Total Debt",
-                "Long Term Debt And Capital Lease Obligation",
-            ], d)
-            st_debt = _get(bs, [
-                "Current Debt",
-                "Short Long Term Debt",
-                "Current Portion Of Long Term Debt",
-            ], d)
-            cash = _get(bs, [
-                "Cash And Cash Equivalents",
-                "Cash Cash Equivalents And Short Term Investments",
-                "Cash And Short Term Investments",
-            ], d)
-            if np.isnan(cash):
-                cash = 0.0
-            if np.isnan(total_debt):
-                total_debt = (st_debt if not np.isnan(st_debt) else 0.0)
-
-            row["Cash"] = cash
-            row["GrossDebt"] = total_debt
-            row["NetDebt"] = total_debt - cash
-
-            # ── NWC (Capital de Giro Líquido) ─────────────────────────────
-            curr_a = _get(bs, ["Current Assets", "Total Current Assets"], d)
-            curr_l = _get(bs, ["Current Liabilities", "Total Current Liabilities"], d)
-            st_d_safe = st_debt if not np.isnan(st_debt) else 0.0
-            if not np.isnan(curr_a) and not np.isnan(curr_l):
-                row["NWC"] = (curr_a - cash) - (curr_l - st_d_safe)
-            else:
-                row["NWC"] = np.nan
-
-            rows.append(row)
-
-        df = (
-            pd.DataFrame(rows)
-            .sort_values("Date")
-            .reset_index(drop=True)
-        )
-        df["Delta_NWC"] = df["NWC"].diff().fillna(0.0)
-        df["Leverage"] = df["NetDebt"] / df["EBITDA"].replace(0, np.nan)
-        return df
-
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"Erro ao extrair trimestres: {exc}")
+    if income.empty and balance.empty and cashflow.empty:
         return pd.DataFrame()
 
+    results = pd.DataFrame()
 
-# ──────────────────────────────────────────────────────────────────────────────
-# MÓDULO 2 — MOTOR DCF
-# ──────────────────────────────────────────────────────────────────────────────
+    # ── Income Statement ──────────────────────────────────────────────────────
+    if not income.empty:
+        results["Revenue"] = _get_col(
+            income, ["Total Revenue", "Revenue", "Gross Profit"]
+        )
+        results["EBIT"] = _get_col(
+            income, ["EBIT", "Operating Income", "Ebit"]
+        )
+        results["Net_Income"] = _get_col(
+            income, ["Net Income", "Net Income Common Stockholders"]
+        )
 
-def calc_fcff(
+    # ── Cash Flow Statement ───────────────────────────────────────────────────
+    if not cashflow.empty:
+        da_raw = _get_col(
+            cashflow,
+            ["Depreciation And Amortization", "Depreciation", "Depreciation Amortization Depletion"],
+        )
+        capex_raw = _get_col(
+            cashflow,
+            ["Capital Expenditure", "Capex", "Purchase Of Ppe", "Capital Expenditures"],
+        )
+        net_borrow = _get_col(
+            cashflow,
+            ["Net Issuance Payments Of Debt", "Changes In Debt", "Net Long Term Debt Issuance"],
+        )
+
+        results["DA"] = da_raw.abs() if not da_raw.empty else pd.Series(dtype=float)
+        results["Capex"] = capex_raw.abs() if not capex_raw.empty else pd.Series(dtype=float)
+        results["Net_Borrowing"] = (
+            net_borrow if not net_borrow.empty else pd.Series(dtype=float)
+        )
+
+    # ── Balance Sheet ─────────────────────────────────────────────────────────
+    if not balance.empty:
+        total_debt = _get_col(
+            balance, ["Total Debt", "Long Term Debt And Capital Lease Obligation", "Long Term Debt"]
+        )
+        cash = _get_col(
+            balance,
+            ["Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments", "Cash"],
+        )
+        curr_assets = _get_col(balance, ["Current Assets", "Total Current Assets"])
+        curr_liab = _get_col(balance, ["Current Liabilities", "Total Current Liabilities"])
+
+        if not total_debt.empty and not cash.empty:
+            results["Net_Debt"] = total_debt.fillna(0) - cash.fillna(0)
+        elif not total_debt.empty:
+            results["Net_Debt"] = total_debt.fillna(0)
+
+        if not curr_assets.empty and not curr_liab.empty:
+            results["NWC"] = curr_assets.fillna(0) - curr_liab.fillna(0)
+
+    # ── EBITDA = EBIT + D&A ───────────────────────────────────────────────────
+    if "EBIT" in results.columns and "DA" in results.columns:
+        results["EBITDA"] = results["EBIT"].fillna(0) + results["DA"].fillna(0)
+
+    if results.empty:
+        return pd.DataFrame()
+
+    # ── Formatação final ──────────────────────────────────────────────────────
+    results.index = pd.to_datetime(results.index)
+    results = results.sort_index(ascending=False)
+
+    # Converte para bilhões R$
+    num_cols = results.select_dtypes(include=[np.number]).columns
+    results[num_cols] = results[num_cols] / 1e9
+
+    return results.head(12)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_current_price(ticker_sa: str) -> dict:
+    """
+    Busca preço atual, ações em circulação e market cap.
+
+    Returns:
+        dict com chaves: price, shares, market_cap, currency.
+    """
+    try:
+        t = yf.Ticker(ticker_sa)
+        info = t.info or {}
+        price = float(
+            info.get("currentPrice")
+            or info.get("previousClose")
+            or info.get("regularMarketPrice")
+            or 0.0
+        )
+        shares = float(info.get("sharesOutstanding") or 0)
+        mkt_cap = float(info.get("marketCap") or (price * shares))
+        return {
+            "price": price,
+            "shares": shares,
+            "market_cap": mkt_cap,
+            "currency": info.get("currency", "BRL"),
+        }
+    except Exception:
+        return {"price": 0.0, "shares": 0.0, "market_cap": 0.0, "currency": "BRL"}
+
+
+# ==============================================================================
+# MÓDULO 3: MOTOR DCF
+# ==============================================================================
+
+def calculate_fcff(
     ebit: float,
     tax_rate: float,
     da: float,
     capex: float,
     delta_nwc: float,
 ) -> float:
-    """FCFF = EBIT × (1 – t) + D&A – CapEx – ΔNWC"""
-    return ebit * (1 - tax_rate) + da - capex - delta_nwc
+    """
+    FCFF = EBIT × (1 − t) + D&A − CapEx − ΔNWC
+
+    Args:
+        ebit: Lucro Operacional (R$ bi).
+        tax_rate: Alíquota efetiva de IR/CSLL (decimal).
+        da: Depreciação e Amortização (R$ bi).
+        capex: Capital Expenditure (R$ bi, valor positivo).
+        delta_nwc: Variação do Capital de Giro (R$ bi).
+
+    Returns:
+        FCFF em R$ bilhões.
+    """
+    return ebit * (1.0 - tax_rate) + da - capex - delta_nwc
 
 
-def calc_fcfe(
+def calculate_fcfe(
     net_income: float,
     da: float,
     capex: float,
     delta_nwc: float,
-    net_borrowing: float = 0.0,
+    net_borrowing: float,
 ) -> float:
-    """FCFE = Lucro Líquido + D&A – CapEx – ΔNWC + Net Borrowing"""
+    """
+    FCFE = Net Income + D&A − CapEx − ΔNWC + Net Borrowing
+
+    Args:
+        net_income: Lucro Líquido (R$ bi).
+        da: D&A (R$ bi).
+        capex: CapEx (R$ bi, positivo).
+        delta_nwc: Variação do Capital de Giro (R$ bi).
+        net_borrowing: Captação líquida de dívida (R$ bi).
+
+    Returns:
+        FCFE em R$ bilhões.
+    """
     return net_income + da - capex - delta_nwc + net_borrowing
 
 
-def gordon_tv(terminal_fcf: float, wacc: float, g: float) -> float:
-    """TV = FCF_{t+1} / (WACC – g)  —  Fórmula de Gordon."""
+def gordon_terminal_value(fcf_next_year: float, wacc: float, g: float) -> float:
+    """
+    Perpetuidade de Gordon: TV = FCFF_{t+1} / (WACC − g)
+
+    Args:
+        fcf_next_year: FCF do primeiro ano da perpetuidade (R$ bi).
+        wacc: Custo médio ponderado de capital (decimal).
+        g: Taxa de crescimento perpétuo (decimal, deve ser < WACC).
+
+    Returns:
+        Valor Terminal em R$ bilhões, ou 0 se WACC ≤ g.
+    """
     if wacc <= g:
-        raise ValueError(
-            f"WACC ({wacc:.2%}) deve ser maior que g ({g:.2%}) para calcular o Valor Terminal."
-        )
-    return terminal_fcf / (wacc - g)
+        return 0.0
+    return fcf_next_year / (wacc - g)
 
 
-def project_fcfs(
+def run_dcf_projection(
     base_revenue: float,
+    base_ebitda_margin: float,
     base_da: float,
-    base_capex: float,
+    base_capex_pct_revenue: float,
     base_nwc: float,
     tax_rate: float,
-    revenue_growth_rates: List[float],
-    ebitda_margin_path: List[float],
-    capex_pct_revenue: float,
-    da_growth_pa: float,
-    nwc_pct_revenue: float,
-    is_fcfe: bool = False,
-    net_income_margin_path: Optional[List[float]] = None,
-    net_borrowing: float = 0.0,
-) -> List[float]:
+    scenario: dict,
+    is_financial: bool = False,
+    base_net_income: float = 0.0,
+    base_net_borrowing: float = 0.0,
+) -> dict:
     """
-    Projeta FCFs (FCFF ou FCFE) para os anos explícitos.
+    Projeta FCFs para os anos 1–3 e calcula Valor Terminal e Enterprise Value.
 
-    Parâmetros
-    ----------
-    base_revenue          : Receita base anualizada (R$)
-    base_da               : D&A base anualizado (R$)
-    base_capex            : Capex base anualizado (R$) — não utilizado diretamente
-    base_nwc              : NWC atual (R$) — ponto de partida do capital de giro
-    tax_rate              : Alíquota efetiva de IR+CSLL
-    revenue_growth_rates  : Taxa de crescimento da receita por ano [list]
-    ebitda_margin_path    : Margem EBITDA por ano [list]
-    capex_pct_revenue     : Capex como % da receita (constante)
-    da_growth_pa          : Crescimento anual do D&A (constante)
-    nwc_pct_revenue       : NWC como % da receita (constante)
-    is_fcfe               : True → calcula FCFE; False → FCFF
-    net_income_margin_path: Margem líquida por ano (apenas FCFE)
-    net_borrowing         : Captação líquida anual (apenas FCFE)
+    Args:
+        base_revenue: Receita LTM (R$ bi).
+        base_ebitda_margin: Margem EBITDA LTM (decimal).
+        base_da: D&A LTM (R$ bi).
+        base_capex_pct_revenue: CapEx / Receita LTM (decimal).
+        base_nwc: NWC LTM (R$ bi).
+        tax_rate: Alíquota efetiva (decimal).
+        scenario: dict com chaves: revenue_growth (list[3]), ebitda_margin (list[3]),
+                  wacc, g, da_growth, capex_pct_revenue, nwc_pct_revenue.
+        is_financial: Se True, usa FCFE em vez de FCFF.
+        base_net_income: Lucro Líquido LTM (R$ bi), usado no FCFE.
+        base_net_borrowing: Captação líquida LTM (R$ bi), usado no FCFE.
+
+    Returns:
+        dict com chaves: projections (DataFrame), fcfs (list), tv, pv_fcfs,
+        pv_tv, enterprise_value.
     """
-    fcf_list: List[float] = []
+    n_years = 3
     revenue = base_revenue
+    da = base_da
     nwc_prev = base_nwc
+    net_income = base_net_income
+    net_borrowing = base_net_borrowing
+    wacc = scenario["wacc"]
+    g = scenario["g"]
+    capex_pct = scenario.get("capex_pct_revenue", base_capex_pct_revenue)
+    nwc_pct = scenario.get("nwc_pct_revenue", base_nwc / max(base_revenue, 1e-6))
+    da_growth_rate = scenario.get("da_growth", 0.03)
 
-    for i, g_rev in enumerate(revenue_growth_rates):
-        revenue *= (1 + g_rev)
-        ebitda = revenue * ebitda_margin_path[i]
-        da = base_da * ((1 + da_growth_pa) ** (i + 1))
-        ebit = ebitda - da
-        capex = revenue * capex_pct_revenue
-        nwc = revenue * nwc_pct_revenue
-        delta_nwc = nwc - nwc_prev
-        nwc_prev = nwc
+    projections: list[dict] = []
+    fcfs: list[float] = []
 
-        if is_fcfe and net_income_margin_path:
-            net_income = revenue * net_income_margin_path[i]
-            fcf = calc_fcfe(net_income, da, capex, delta_nwc, net_borrowing)
+    for year in range(1, n_years + 1):
+        g_rev = scenario["revenue_growth"][year - 1]
+        margin = scenario["ebitda_margin"][year - 1]
+
+        revenue_proj = revenue * (1.0 + g_rev)
+        ebitda_proj = revenue_proj * margin
+        da_proj = da * (1.0 + da_growth_rate)
+        ebit_proj = ebitda_proj - da_proj
+        capex_proj = revenue_proj * capex_pct
+        nwc_proj = revenue_proj * nwc_pct
+        delta_nwc = nwc_proj - nwc_prev
+
+        if not is_financial:
+            fcf = calculate_fcff(ebit_proj, tax_rate, da_proj, capex_proj, delta_nwc)
         else:
-            fcf = calc_fcff(ebit, tax_rate, da, capex, delta_nwc)
+            # Crescimento proporcional do lucro líquido
+            ni_proj = net_income * (1.0 + g_rev) * (margin / max(base_ebitda_margin, 1e-6))
+            fcf = calculate_fcfe(ni_proj, da_proj, capex_proj, delta_nwc, net_borrowing)
 
-        fcf_list.append(fcf)
+        projections.append(
+            {
+                "Ano": f"Ano {year}",
+                "Receita (R$bi)": round(revenue_proj, 3),
+                "EBITDA (R$bi)": round(ebitda_proj, 3),
+                "Margem EBITDA": margin,
+                "EBIT (R$bi)": round(ebit_proj, 3),
+                "D&A (R$bi)": round(da_proj, 3),
+                "CapEx (R$bi)": round(capex_proj, 3),
+                "ΔNWC (R$bi)": round(delta_nwc, 3),
+                "FCF (R$bi)": round(fcf, 3),
+            }
+        )
+        fcfs.append(fcf)
 
-    return fcf_list
+        # Atualiza base para próximo ano
+        revenue = revenue_proj
+        da = da_proj
+        nwc_prev = nwc_proj
+        if is_financial:
+            net_income = ni_proj
 
+    # Valor Terminal (FCF do ano 4 = FCF_{n} × (1+g))
+    fcf_terminal = fcfs[-1] * (1.0 + g)
+    tv = gordon_terminal_value(fcf_terminal, wacc, g)
 
-def dcf_engine(
-    fcf_projections: List[float],
-    wacc: float,
-    g: float,
-    net_debt: float,
-    shares: float,
-    is_fcfe: bool = False,
-) -> Dict[str, float]:
-    """
-    Motor DCF completo.
-
-    Retorna
-    -------
-    dict com: PV_FCF, PV_TV, TV, Enterprise_Value, Equity_Value, Fair_Price
-    """
-    n = len(fcf_projections)
-
-    # Valor presente dos fluxos explícitos
-    pv_fcf = sum(
-        cf / (1 + wacc) ** (t + 1)
-        for t, cf in enumerate(fcf_projections)
-    )
-
-    # Valor Terminal (Gordon Growth)
-    terminal_fcf = fcf_projections[-1] * (1 + g) if fcf_projections else 0.0
-    tv = gordon_tv(terminal_fcf, wacc, g)
-    pv_tv = tv / (1 + wacc) ** n
-
-    if is_fcfe:
-        equity_value = pv_fcf + pv_tv
-        enterprise_value = equity_value + net_debt
-    else:
-        enterprise_value = pv_fcf + pv_tv
-        equity_value = enterprise_value - net_debt
-
-    fair_price = equity_value / shares if (shares and shares > 0) else np.nan
+    # PV dos FCFs explícitos e do TV
+    pv_fcfs = sum(fcf / (1.0 + wacc) ** (i + 1) for i, fcf in enumerate(fcfs))
+    pv_tv = tv / (1.0 + wacc) ** n_years
+    enterprise_value = pv_fcfs + pv_tv
 
     return {
-        "PV_FCF": pv_fcf,
-        "PV_TV": pv_tv,
-        "TV": tv,
-        "Enterprise_Value": enterprise_value,
-        "Equity_Value": equity_value,
-        "Fair_Price": fair_price,
+        "projections": pd.DataFrame(projections).set_index("Ano"),
+        "fcfs": fcfs,
+        "tv": tv,
+        "pv_fcfs": pv_fcfs,
+        "pv_tv": pv_tv,
+        "enterprise_value": enterprise_value,
     }
 
 
-def calc_irr(
-    current_price: float,
-    fcf_projections: List[float],
-    g: float,
+def equity_value_per_share(
+    enterprise_value: float,
     net_debt: float,
-    shares: float,
-    is_fcfe: bool = False,
+    shares_outstanding: float,
+    is_financial: bool = False,
 ) -> float:
     """
-    TIR implícita: taxa que iguala o preço atual ao Equity Value
-    calculado pelo DCF via método de Brent (scipy).
+    Calcula o preço justo por ação.
+
+    Para setor real: Equity Value = EV − Dívida Líquida.
+    Para financeiras: EV já representa o equity (FCFE).
+
+    Args:
+        enterprise_value: EV em R$ bilhões.
+        net_debt: Dívida Líquida em R$ bilhões.
+        shares_outstanding: Ações em circulação (unidades absolutas).
+        is_financial: Se True, FCFE já é direto ao acionista.
+
+    Returns:
+        Preço justo por ação em R$.
     """
-    n = len(fcf_projections)
+    if shares_outstanding <= 0:
+        return 0.0
 
-    def _equity_at_rate(r: float) -> float:
-        pv = sum(cf / (1 + r) ** (t + 1) for t, cf in enumerate(fcf_projections))
-        tv = fcf_projections[-1] * (1 + g) / (r - g) if r > g else 0.0
-        pv_tv = tv / (1 + r) ** n
-        if is_fcfe:
-            eq_val = pv + pv_tv
-        else:
-            eq_val = pv + pv_tv - net_debt
-        return eq_val / shares if shares > 0 else np.nan
+    equity_bi = enterprise_value if is_financial else (enterprise_value - net_debt)
+    equity_bi = max(equity_bi, 0.0)
 
-    def _obj(r: float) -> float:
-        return _equity_at_rate(r) - current_price
+    # Converte bilhões para unidades absolutas / (bilhões de ações)
+    shares_bi = shares_outstanding / 1e9
+    return equity_bi / max(shares_bi, 1e-9)
+
+
+def calculate_implicit_irr(
+    current_price: float,
+    shares_outstanding: float,
+    fcfs: list,
+    tv: float,
+    n_years: int = 3,
+) -> float:
+    """
+    TIR implícita da compra no preço de tela atual.
+
+    Resolve: Market_Cap = sum(FCFi/(1+IRR)^i) + TV/(1+IRR)^n → IRR
+
+    Args:
+        current_price: Preço atual em R$.
+        shares_outstanding: Ações em circulação (unidades absolutas).
+        fcfs: Lista de FCFs projetados (R$ bi).
+        tv: Valor Terminal (R$ bi).
+        n_years: Horizonte explícito de projeção.
+
+    Returns:
+        TIR implícita (decimal) ou nan se não convergir.
+    """
+    market_cap_bi = current_price * shares_outstanding / 1e9  # em R$ bilhões
+
+    def npv_func(r: float) -> float:
+        pv = sum(fcf / (1.0 + r) ** (i + 1) for i, fcf in enumerate(fcfs))
+        pv += tv / (1.0 + r) ** n_years
+        return pv - market_cap_bi
 
     try:
-        return brentq(_obj, g + 1e-4, 0.80, xtol=1e-6, maxiter=300)
+        # Tenta encontrar sinal trocado para o brentq
+        irr = brentq(npv_func, -0.5, 5.0, xtol=1e-8, maxiter=1000)
+        return irr
     except Exception:
         return np.nan
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# MÓDULO 3 — ANÁLISE DE SENSIBILIDADE
-# ──────────────────────────────────────────────────────────────────────────────
+# ==============================================================================
+# MÓDULO 4: ANÁLISE DE SENSIBILIDADE
+# ==============================================================================
 
-def build_sensitivity(
+def build_sensitivity_matrix(
     base_revenue: float,
+    base_ebitda_margin: float,
     base_da: float,
+    base_capex_pct: float,
     base_nwc: float,
     tax_rate: float,
-    revenue_growth_rates: List[float],
-    capex_pct: float,
-    da_growth: float,
-    nwc_pct: float,
+    revenue_growth: list,
+    g_base: float,
+    wacc_base: float,
     net_debt: float,
-    shares: float,
-    wacc_range: np.ndarray,
-    y_range: np.ndarray,
-    y_axis: str,               # "ebitda_margin" | "g"
-    fixed_g: float,
-    fixed_margin: float,
+    shares_outstanding: float,
     current_price: float,
-    is_fcfe: bool = False,
-    base_nim: float = 0.10,
+    is_financial: bool = False,
+    sensitivity_y: str = "g",  # "g" ou "ebitda_margin"
 ) -> pd.DataFrame:
     """
-    Gera matriz de sensibilidade: WACC (eixo X) × Margem EBITDA|g (eixo Y).
-    Célula = Margem de Segurança se current_price disponível, senão Preço Justo.
+    Gera matriz de preços justos iterando WACC (X) e g ou Margem EBITDA (Y).
+
+    Args:
+        sensitivity_y: "g" varia a taxa de perpetuidade; "ebitda_margin" varia a margem.
+
+    Returns:
+        DataFrame cujo índice é Y e cujas colunas são WACC (formatados em %).
     """
-    rows: List[List[float]] = []
+    step = 0.01
+    wacc_min = max(0.06, wacc_base - 0.04)
+    wacc_max = wacc_base + 0.045
+    wacc_range = np.arange(wacc_min, wacc_max, step)
+
+    if sensitivity_y == "g":
+        y_min = max(0.01, g_base - 0.03)
+        y_max = min(g_base + 0.035, wacc_base - 0.01)
+        y_range = np.arange(y_min, y_max, step)
+        y_title = "g (Perp.)"
+    else:
+        y_min = max(0.03, base_ebitda_margin - 0.08)
+        y_max = base_ebitda_margin + 0.085
+        y_range = np.arange(y_min, y_max, 0.02)
+        y_title = "Margem EBITDA"
+
+    matrix = pd.DataFrame(
+        index=np.round(y_range, 4), columns=np.round(wacc_range, 4), dtype=float
+    )
+
+    nwc_pct = base_nwc / max(base_revenue, 1e-6)
 
     for y_val in y_range:
-        row_vals: List[float] = []
-        for w in wacc_range:
+        for wacc_val in wacc_range:
+            g_use = y_val if sensitivity_y == "g" else g_base
+            if wacc_val <= g_use + 0.001:
+                matrix.loc[round(y_val, 4), round(wacc_val, 4)] = np.nan
+                continue
+            margin_use = (
+                [base_ebitda_margin] * 3 if sensitivity_y == "g" else [y_val] * 3
+            )
             try:
-                if y_axis == "ebitda_margin":
-                    margin_path = [float(y_val)] * len(revenue_growth_rates)
-                    g = fixed_g
-                else:
-                    margin_path = [fixed_margin] * len(revenue_growth_rates)
-                    g = float(y_val)
-
-                if w <= g + 1e-4:
-                    row_vals.append(np.nan)
-                    continue
-
-                nim_path = [base_nim] * len(revenue_growth_rates) if is_fcfe else None
-
-                fcf_proj = project_fcfs(
-                    base_revenue=base_revenue,
-                    base_da=base_da,
-                    base_capex=0.0,
-                    base_nwc=base_nwc,
-                    tax_rate=tax_rate,
-                    revenue_growth_rates=revenue_growth_rates,
-                    ebitda_margin_path=margin_path,
-                    capex_pct_revenue=capex_pct,
-                    da_growth_pa=da_growth,
-                    nwc_pct_revenue=nwc_pct,
-                    is_fcfe=is_fcfe,
-                    net_income_margin_path=nim_path,
+                scenario_s = {
+                    "revenue_growth": revenue_growth,
+                    "ebitda_margin": margin_use,
+                    "wacc": wacc_val,
+                    "g": g_use,
+                    "da_growth": 0.03,
+                    "capex_pct_revenue": base_capex_pct,
+                    "nwc_pct_revenue": nwc_pct,
+                }
+                result = run_dcf_projection(
+                    base_revenue, base_ebitda_margin, base_da,
+                    base_capex_pct, base_nwc, tax_rate, scenario_s, is_financial
                 )
-
-                res = dcf_engine(fcf_proj, w, g, net_debt, shares, is_fcfe)
-                fp = res["Fair_Price"]
-
-                if (
-                    not np.isnan(current_price)
-                    and current_price > 0
-                    and not np.isnan(fp)
-                ):
-                    cell = (fp - current_price) / current_price
-                else:
-                    cell = fp
-
-                row_vals.append(round(cell, 4) if not np.isnan(cell) else np.nan)
-
+                fair = equity_value_per_share(
+                    result["enterprise_value"], net_debt, shares_outstanding, is_financial
+                )
+                matrix.loc[round(y_val, 4), round(wacc_val, 4)] = round(fair, 2)
             except Exception:
-                row_vals.append(np.nan)
+                matrix.loc[round(y_val, 4), round(wacc_val, 4)] = np.nan
 
-        rows.append(row_vals)
+    matrix.index = [f"{v:.1%}" for v in matrix.index]
+    matrix.columns = [f"{v:.1%}" for v in matrix.columns]
+    matrix.index.name = y_title
+    matrix.columns.name = "WACC"
 
-    return pd.DataFrame(
-        rows,
-        index=np.round(y_range, 4),
-        columns=np.round(wacc_range, 4),
-    )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# MÓDULO 4 — GRÁFICOS PLOTLY
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _dark_layout(**kwargs) -> Dict[str, Any]:
-    """Layout base dark theme para todos os gráficos."""
-    base = dict(
-        plot_bgcolor=CHART_BG,
-        paper_bgcolor=CHART_PAPER,
-        font=dict(color=CHART_FONT, size=12),
-        margin=dict(t=60, b=40, l=60, r=40),
-    )
-    base.update(kwargs)
-    return base
+    return matrix
 
 
-def chart_leverage(df: pd.DataFrame) -> go.Figure:
-    """Barras de Alavancagem (ND/EBITDA) com limiares de atenção."""
+# ==============================================================================
+# MÓDULO 5: VISUALIZAÇÕES
+# ==============================================================================
+
+def plot_leverage_chart(df_q: pd.DataFrame) -> go.Figure:
+    """
+    Plota evolução da Dívida Líquida e do índice DL/EBITDA.
+    """
     fig = go.Figure()
-    if df.empty or "Leverage" not in df.columns:
+    if df_q.empty or "Net_Debt" not in df_q.columns:
+        fig.update_layout(title="Dados insuficientes para Alavancagem")
         return fig
 
-    df_p = df.dropna(subset=["Leverage"]).copy()
-    df_p["DateStr"] = df_p["Date"].dt.strftime("%Y-%m")
-    colors = df_p["Leverage"].apply(
-        lambda x: "#EF4444" if x > 3.5 else ("#F59E0B" if x > 2.5 else "#22C55E")
-    )
+    df = df_q.copy().reset_index()
+    df.columns = [str(c) for c in df.columns]
+    date_col = df.columns[0]
+    labels = pd.to_datetime(df[date_col]).dt.strftime("%Y-%m")
 
-    fig.add_trace(go.Bar(
-        x=df_p["DateStr"],
-        y=df_p["Leverage"],
-        marker_color=colors,
-        text=df_p["Leverage"].round(2),
-        textposition="outside",
-        name="ND/EBITDA",
-    ))
-    fig.add_hline(y=2.5, line_dash="dash", line_color="#F59E0B",
-                  annotation_text="Atenção (2,5x)", annotation_position="top left")
-    fig.add_hline(y=3.5, line_dash="dash", line_color="#EF4444",
-                  annotation_text="Crítico (3,5x)", annotation_position="top left")
-
-    fig.update_layout(
-        title="📊 Evolução da Alavancagem — Dívida Líquida / EBITDA",
-        xaxis_title="Trimestre",
-        yaxis_title="ND/EBITDA (x)",
-        showlegend=False,
-        **_dark_layout(),
-    )
-    return fig
-
-
-def chart_capex_da(df: pd.DataFrame) -> go.Figure:
-    """Barras agrupadas Capex vs D&A + linha Capex/D&A."""
-    fig = go.Figure()
-    if df.empty or "Capex" not in df.columns:
-        return fig
-
-    df_p = df.dropna(subset=["Capex", "DA"], how="all").copy()
-    df_p["DateStr"] = df_p["Date"].dt.strftime("%Y-%m")
-    cap_bi = df_p["Capex"] / 1e9
-    da_bi = df_p["DA"].abs() / 1e9
-
-    fig.add_trace(go.Bar(x=df_p["DateStr"], y=cap_bi,
-                         name="Capex", marker_color="#3B82F6", opacity=0.85))
-    fig.add_trace(go.Bar(x=df_p["DateStr"], y=da_bi,
-                         name="D&A", marker_color="#8B5CF6", opacity=0.85))
-
-    ratio = (cap_bi / da_bi.replace(0, np.nan)).round(2)
-    fig.add_trace(go.Scatter(
-        x=df_p["DateStr"], y=ratio,
-        name="Capex/D&A (x)", yaxis="y2",
-        line=dict(color="#F59E0B", width=2, dash="dot"),
-        mode="lines+markers",
-    ))
-
-    fig.update_layout(
-        title="🔧 Capex Executado vs D&A (R$ Bilhões)",
-        barmode="group",
-        xaxis_title="Trimestre",
-        yaxis_title="R$ Bilhões",
-        yaxis2=dict(title="Capex/D&A (x)", overlaying="y", side="right",
-                    showgrid=False),
-        legend=dict(orientation="h", y=1.12),
-        **_dark_layout(),
-    )
-    return fig
-
-
-def chart_waterfall(result: Dict[str, float], net_debt: float, label: str) -> go.Figure:
-    """Waterfall: PV FCFs → PV TV → EV → (−) ND → Equity."""
-    pv_fcf = result.get("PV_FCF", 0) / 1e9
-    pv_tv = result.get("PV_TV", 0) / 1e9
-    ev = result.get("Enterprise_Value", 0) / 1e9
-    nd = net_debt / 1e9
-    eq = result.get("Equity_Value", 0) / 1e9
-
-    fig = go.Figure(go.Waterfall(
-        orientation="v",
-        measure=["relative", "relative", "total", "relative", "total"],
-        x=["PV FCFs Explícitos", "PV Valor Terminal",
-           "Enterprise Value", "(−) Dívida Líquida", "Equity Value"],
-        y=[pv_fcf, pv_tv, 0, -nd, 0],
-        connector={"line": {"color": "#334155"}},
-        increasing={"marker": {"color": "#22C55E"}},
-        decreasing={"marker": {"color": "#EF4444"}},
-        totals={"marker": {"color": "#3B82F6"}},
-        text=[f"R${v:.1f}Bi" for v in [pv_fcf, pv_tv, ev, -nd, eq]],
-        textposition="outside",
-    ))
-    fig.update_layout(
-        title=f"🌊 Waterfall DCF — {label}",
-        yaxis_title="R$ Bilhões",
-        **_dark_layout(),
-    )
-    return fig
-
-
-def chart_fcf_projection(
-    fcf_cons: List[float],
-    fcf_mod: List[float],
-    years: int,
-) -> go.Figure:
-    """Barras agrupadas da projeção de FCF por cenário."""
-    xlabels = [f"Ano {i + 1}" for i in range(years)]
-    fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=xlabels,
-        y=[v / 1e9 for v in fcf_cons],
-        name="🐢 Conservador",
-        marker_color="#EF4444",
-        opacity=0.85,
-    ))
-    fig.add_trace(go.Bar(
-        x=xlabels,
-        y=[v / 1e9 for v in fcf_mod],
-        name="🚀 Moderado",
-        marker_color="#22C55E",
-        opacity=0.85,
-    ))
-    fig.update_layout(
-        title="📈 FCF Projetado por Cenário (R$ Bilhões)",
-        barmode="group",
-        xaxis_title="Ano de Projeção",
-        yaxis_title="FCF (R$ Bi)",
-        legend=dict(orientation="h", y=1.12),
-        **_dark_layout(),
-    )
-    return fig
-
-
-def chart_heatmap(
-    df_sens: pd.DataFrame,
-    y_label: str,
-    current_price: float,
-) -> go.Figure:
-    """Heatmap de Margem de Segurança: WACC (X) × Variável Y."""
-    is_mos = not np.isnan(current_price) and current_price > 0
-    z = df_sens.values.astype(float)
-
-    colorscale = [
-        [0.00, "#7F1D1D"],
-        [0.35, "#DC2626"],
-        [0.48, "#F59E0B"],
-        [0.52, "#FAFAFA"],
-        [0.65, "#22C55E"],
-        [1.00, "#14532D"],
-    ] if is_mos else "RdYlGn"
-
-    if is_mos:
-        text_m = [[f"{v:.1%}" if not np.isnan(v) else "N/D" for v in row] for row in z]
-        cb_title = "Margem de Seg."
-        zmid = 0.0
-    else:
-        text_m = [[f"R${v:.2f}" if not np.isnan(v) else "N/D" for v in row] for row in z]
-        cb_title = "Preço Justo (R$)"
-        zmid = None
-
-    fig = go.Figure(data=go.Heatmap(
-        z=z,
-        x=[f"{v:.1%}" for v in df_sens.columns],
-        y=[f"{v:.1%}" for v in df_sens.index],
-        colorscale=colorscale,
-        zmid=zmid,
-        text=text_m,
-        texttemplate="%{text}",
-        textfont={"size": 10},
-        colorbar=dict(title=cb_title),
-        hoverongaps=False,
-    ))
-
-    if is_mos:
-        fig.add_annotation(
-            text="🟢 Verde = Margem de Segurança Positiva  |  🔴 Vermelho = Ativo Sobreavaliado",
-            xref="paper", yref="paper",
-            x=0.5, y=-0.14,
-            showarrow=False,
-            font=dict(color="#94A3B8", size=11),
-        )
-
-    fig.update_layout(
-        title=f"🔥 Sensibilidade: WACC × {y_label}",
-        xaxis_title="WACC",
-        yaxis_title=y_label,
-        height=500,
-        **_dark_layout(),
-    )
-    return fig
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# MÓDULO 5 — SIDEBAR
-# ──────────────────────────────────────────────────────────────────────────────
-
-def render_sidebar() -> Dict[str, Any]:
-    """Sidebar: seleção de ticker e tipo de empresa."""
-    with st.sidebar:
-        st.markdown("## 📊 ValuationB3")
-        st.markdown("*DCF Engine para o Mercado Brasileiro*")
-        st.divider()
-
-        st.markdown("### 🎯 Ativo")
-        ticker_raw = st.text_input(
-            "Ticker (sem .SA)",
-            value="WEGE3",
-            help="Ex: PETR4, VALE3, ITUB4, RADL3, RENT3",
-        ).upper().strip()
-
-        is_financial = st.toggle(
-            "🏦 Instituição Financeira",
-            value=False,
-            help="Bancos e seguradoras usam FCFE. Empresas reais usam FCFF.",
-        )
-
-        if is_financial:
-            st.info("**Modo FCFE** ativado — adequado para bancos, seguradoras e fintechs.")
+    leverage = []
+    for _, row in df.iterrows():
+        ebitda = row.get("EBITDA", np.nan)
+        nd = row.get("Net_Debt", np.nan)
+        if pd.notna(ebitda) and ebitda != 0 and pd.notna(nd):
+            leverage.append(round(nd / ebitda, 2))
         else:
-            st.info("**Modo FCFF** ativado — adequado para empresas do setor real.")
+            leverage.append(np.nan)
+
+    fig.add_trace(
+        go.Bar(
+            x=labels, y=df.get("Net_Debt", pd.Series()),
+            name="Dívida Líquida (R$ bi)",
+            marker_color="#EF553B", opacity=0.75,
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=labels, y=leverage,
+            name="DL / EBITDA (x)",
+            mode="lines+markers", yaxis="y2",
+            line=dict(color="#00CC96", width=2.5),
+            marker=dict(size=6),
+        )
+    )
+    fig.update_layout(
+        title="Alavancagem — Dívida Líquida & DL/EBITDA",
+        yaxis=dict(title="R$ bi"),
+        yaxis2=dict(
+            title="DL/EBITDA (x)", overlaying="y", side="right", showgrid=False
+        ),
+        legend=dict(orientation="h", y=1.08),
+        template="plotly_dark", height=370,
+    )
+    return fig
+
+
+def plot_capex_da_chart(df_q: pd.DataFrame) -> go.Figure:
+    """Plota CapEx executado vs. D&A."""
+    fig = go.Figure()
+    if df_q.empty:
+        return fig
+
+    df = df_q.copy().reset_index()
+    df.columns = [str(c) for c in df.columns]
+    date_col = df.columns[0]
+    labels = pd.to_datetime(df[date_col]).dt.strftime("%Y-%m")
+
+    if "Capex" in df.columns:
+        fig.add_trace(
+            go.Bar(
+                x=labels, y=df["Capex"],
+                name="CapEx (R$ bi)", marker_color="#636EFA",
+            )
+        )
+    if "DA" in df.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=labels, y=df["DA"],
+                name="D&A (R$ bi)", mode="lines+markers",
+                line=dict(color="#FFA15A", width=2.5, dash="dot"),
+            )
+        )
+    fig.update_layout(
+        title="CapEx Executado vs. D&A (R$ bi)",
+        barmode="group",
+        template="plotly_dark", height=370,
+        legend=dict(orientation="h", y=1.08),
+    )
+    return fig
+
+
+def plot_ebitda_evolution(df_q: pd.DataFrame) -> go.Figure:
+    """Plota Receita, EBITDA e Margem EBITDA."""
+    fig = go.Figure()
+    if df_q.empty or "EBITDA" not in df_q.columns or "Revenue" not in df_q.columns:
+        return fig
+
+    df = df_q[["Revenue", "EBITDA"]].dropna().reset_index()
+    df.columns = ["Data", "Receita", "EBITDA"]
+    df["Margem (%)"] = (df["EBITDA"] / df["Receita"].replace(0, np.nan) * 100).round(1)
+    labels = pd.to_datetime(df["Data"]).dt.strftime("%Y-%m")
+
+    fig.add_trace(
+        go.Bar(x=labels, y=df["Receita"], name="Receita (R$ bi)",
+               marker_color="#636EFA", opacity=0.55)
+    )
+    fig.add_trace(
+        go.Bar(x=labels, y=df["EBITDA"], name="EBITDA (R$ bi)",
+               marker_color="#00CC96")
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=labels, y=df["Margem (%)"],
+            name="Margem EBITDA (%)", mode="lines+markers",
+            yaxis="y2", line=dict(color="#FFA15A", width=2.5),
+        )
+    )
+    fig.update_layout(
+        title="Receita, EBITDA & Margem",
+        barmode="overlay",
+        yaxis=dict(title="R$ bi"),
+        yaxis2=dict(title="%", overlaying="y", side="right", showgrid=False),
+        template="plotly_dark", height=370,
+        legend=dict(orientation="h", y=1.08),
+    )
+    return fig
+
+
+def plot_sensitivity_heatmap(
+    matrix: pd.DataFrame,
+    current_price: float,
+    title: str = "Sensibilidade — Preço Justo (R$)",
+) -> go.Figure:
+    """
+    Heatmap de sensibilidade com preço justo em cada quadrante.
+    Células verdes = upside vs. preço atual; vermelhas = downside.
+    """
+    if matrix.empty:
+        return go.Figure()
+
+    z = matrix.values.astype(float)
+
+    # Anotações com MS em relação ao preço atual
+    cell_text: list[list[str]] = []
+    for row in z:
+        row_text: list[str] = []
+        for val in row:
+            if np.isnan(val):
+                row_text.append("N/D")
+            else:
+                ms = (val / max(current_price, 0.01) - 1) * 100
+                sign = "+" if ms >= 0 else ""
+                row_text.append(f"R${val:.1f}<br>{sign}{ms:.0f}%")
+        cell_text.append(row_text)
+
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=z,
+            x=matrix.columns.tolist(),
+            y=matrix.index.tolist(),
+            text=cell_text,
+            texttemplate="%{text}",
+            textfont={"size": 9},
+            colorscale="RdYlGn",
+            zmid=current_price,
+            colorbar=dict(title="Preço Justo<br>(R$)", thickness=14),
+        )
+    )
+    fig.add_annotation(
+        text=f"Preço Atual: R$ {current_price:.2f}",
+        xref="paper", yref="paper",
+        x=0.01, y=-0.08, showarrow=False,
+        font=dict(size=12, color="#FFA15A"),
+    )
+    fig.update_layout(
+        title=title,
+        xaxis_title="WACC",
+        yaxis_title=matrix.index.name or "Y",
+        template="plotly_dark",
+        height=500,
+    )
+    return fig
+
+
+def plot_ev_waterfall(result: dict, scenario_label: str, wacc: float) -> go.Figure:
+    """Waterfall do bridge de EV: PV FCFs + PV TV = EV."""
+    fcfs = result["fcfs"]
+    pv_fcfs_parts = [fcf / (1 + wacc) ** (i + 1) for i, fcf in enumerate(fcfs)]
+
+    measures = ["relative"] * len(pv_fcfs_parts) + ["relative", "total"]
+    x_labels = [f"PV FCF A{i+1}" for i in range(len(pv_fcfs_parts))] + ["PV TV", "EV Total"]
+    y_values = pv_fcfs_parts + [result["pv_tv"], 0]
+
+    fig = go.Figure(
+        go.Waterfall(
+            orientation="v", measure=measures,
+            x=x_labels, y=y_values,
+            connector={"line": {"color": "#555"}},
+            increasing={"marker": {"color": "#00CC96"}},
+            decreasing={"marker": {"color": "#EF553B"}},
+            totals={"marker": {"color": "#636EFA"}},
+        )
+    )
+    fig.update_layout(
+        title=f"Bridge do Enterprise Value — {scenario_label}",
+        yaxis_title="R$ Bilhões",
+        template="plotly_dark", height=380,
+    )
+    return fig
+
+
+# ==============================================================================
+# HELPER: LTM SUM / AVG
+# ==============================================================================
+
+def ltm_sum(df: pd.DataFrame, col: str, n: int = 4) -> float:
+    """Soma os últimos n trimestres de uma coluna."""
+    if df.empty or col not in df.columns:
+        return 0.0
+    return float(df[col].dropna().head(n).sum())
+
+
+def ltm_avg(df: pd.DataFrame, col: str, n: int = 4) -> float:
+    """Média dos últimos n trimestres de uma coluna."""
+    if df.empty or col not in df.columns:
+        return 0.0
+    series = df[col].dropna().head(n)
+    return float(series.mean()) if not series.empty else 0.0
+
+
+# ==============================================================================
+# APP PRINCIPAL
+# ==============================================================================
+
+def main() -> None:
+    """Ponto de entrada da aplicação Streamlit."""
+
+    # ── Header ──────────────────────────────────────────────────────────────
+    st.title("📊 Valuation B3 — DCF Engine Pro")
+    st.markdown(
+        "**Motor de Valuation Fundamentalista | B3** — "
+        "FCFF · FCFE · Gordon Growth · TIR Implícita · Análise de Sensibilidade"
+    )
+
+    # ── Sidebar ─────────────────────────────────────────────────────────────
+    with st.sidebar:
+        st.header("⚙️ Configurações")
+
+        st.subheader("📌 Universo de Ações")
+        multi_select = st.multiselect(
+            "Tickers da Carteira",
+            options=sorted(DEFAULT_TICKERS),
+            default=["WEGE3"],
+            help="Adicione ou remova ações. Análise individual via seletor abaixo.",
+        )
+        custom_ticker = st.text_input(
+            "Adicionar Ticker (sem .SA)",
+            value="",
+            help="Digite qualquer ticker da B3, ex: CYRE3",
+        ).strip().upper()
+        if custom_ticker and custom_ticker not in multi_select:
+            multi_select.append(custom_ticker)
+
+        all_tickers = multi_select if multi_select else ["WEGE3"]
+        selected_ticker = st.selectbox("🎯 Ativo em Análise", options=all_tickers)
+        ticker_sa = f"{selected_ticker}.SA"
 
         st.divider()
-        load_btn = st.button(
-            "🔄 Carregar Dados do Ativo",
+        st.subheader("🏦 Perfil da Empresa")
+        is_financial = st.toggle(
+            "Instituição Financeira",
+            value=False,
+            help="ON → FCFE (bancos, seguradoras) | OFF → FCFF (setor real)",
+        )
+        tax_rate = (
+            st.slider("Alíquota Efetiva IR/CSLL (%)", 15, 40, 34, step=1) / 100.0
+        )
+
+        st.divider()
+        run_btn = st.button(
+            "🚀 Carregar / Atualizar Dados",
             type="primary",
             use_container_width=True,
         )
-
-        st.divider()
-        st.caption(
-            "Fontes: yfinance, Banco Central do Brasil (SGS).\n"
-            "Os dados trimestrais cobrem até 12 trimestres históricos."
-        )
-
-    return {
-        "ticker_raw": ticker_raw,
-        "ticker_yf": f"{ticker_raw}.SA",
-        "is_financial": is_financial,
-        "load_btn": load_btn,
-    }
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# MÓDULO 6 — ABA 1: DIAGNÓSTICO
-# ──────────────────────────────────────────────────────────────────────────────
-
-def render_diagnostico() -> None:
-    """Aba 1 — Diagnóstico do Cenário Atual."""
-    st.header("🔬 Diagnóstico do Cenário Atual")
-    ticker_yf: str = st.session_state["ticker_yf"]
-
-    # ── Macroeconômico (BCB/SGS) ──────────────────────────────────────────
-    with st.spinner("Consultando Banco Central (SGS/BCB)..."):
-        macro = fetch_macro()
-        st.session_state["macro"] = macro
-
-    st.subheader("🏛️ Indicadores Macroeconômicos (BCB)")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("📈 IPCA 12m", f"{macro['ipca_12m']:.2%}")
-    m2.metric("💰 CDI Anual", f"{macro['cdi_anual']:.2%}")
-    m3.metric("🏛️ Meta SELIC", f"{macro['selic']:.2%}")
-    m4.metric("🌱 PIB Nominal Est.", f"{macro['pib_nominal']:.2%}")
-
-    st.divider()
-
-    # ── Dados Trimestrais ─────────────────────────────────────────────────
-    st.subheader(f"📋 Histórico Trimestral — {ticker_yf}")
-
-    df_q: pd.DataFrame = st.session_state["quarterly_df"]
-
-    # Fallback: upload CSV do RI
-    st.markdown("##### 📂 Fallback — Upload de Dados do RI (opcional)")
-    uploaded = st.file_uploader(
-        "CSV com colunas: Date, Revenue, EBIT, EBITDA, DA, Capex, NetDebt, NWC",
-        type=["csv"],
-        key="ri_upload",
-    )
-    if uploaded is not None:
-        try:
-            df_ri = pd.read_csv(uploaded)
-            df_ri["Date"] = pd.to_datetime(df_ri["Date"])
-            df_ri = df_ri.sort_values("Date").reset_index(drop=True)
-            df_ri["Delta_NWC"] = df_ri["NWC"].diff().fillna(0.0)
-            df_ri["Leverage"] = df_ri["NetDebt"] / df_ri["EBITDA"].replace(0, np.nan)
-            df_q = df_ri
-            st.session_state["quarterly_df"] = df_q
-            st.success("✅ Dados do RI carregados com sucesso!")
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"Erro ao processar arquivo: {exc}")
-
-    if df_q.empty:
-        st.warning(
-            "⚠️ Dados trimestrais não disponíveis. "
-            "Faça upload via RI ou verifique se o ticker possui histórico no Yahoo Finance."
-        )
-        return
-
-    # Persiste últimos valores para as abas seguintes
-    last = df_q.iloc[-1]
-
-    def _safe(v: Any) -> float:
-        return float(v) if pd.notna(v) else np.nan
-
-    st.session_state["last_ebitda"] = _safe(last.get("EBITDA"))
-    st.session_state["last_ebit"] = _safe(last.get("EBIT"))
-    st.session_state["last_revenue"] = _safe(last.get("Revenue"))
-    st.session_state["last_da"] = abs(_safe(last.get("DA")) or 0)
-    st.session_state["last_capex"] = abs(_safe(last.get("Capex")) or 0)
-    st.session_state["net_debt_ss"] = _safe(last.get("NetDebt", 0))
-    st.session_state["last_nwc"] = _safe(last.get("NWC")) or 0.0
-
-    # ── LTM (Last Twelve Months) ──────────────────────────────────────────
-    def _ltm_sum(col: str) -> float:
-        if col in df_q.columns:
-            return df_q[col].tail(4).sum()
-        return np.nan
-
-    st.markdown("##### 📊 LTM — Últimos 12 Meses (soma dos 4 últimos trimestres)")
-    l1, l2, l3, l4, l5 = st.columns(5)
-    ltm_rev = _ltm_sum("Revenue")
-    ltm_ebitda = _ltm_sum("EBITDA")
-    ltm_capex = _ltm_sum("Capex")
-    ltm_da = abs(_ltm_sum("DA"))
-    nd_cur = st.session_state["net_debt_ss"]
-
-    def _bi(v: float) -> str:
-        return f"R$ {v / 1e9:.2f} Bi" if not np.isnan(v) else "N/D"
-
-    l1.metric("Receita LTM", _bi(ltm_rev))
-    l2.metric("EBITDA LTM", _bi(ltm_ebitda))
-    l3.metric("Capex LTM", _bi(ltm_capex))
-    l4.metric("D&A LTM", _bi(ltm_da))
-    l5.metric(
-        "Dívida Líquida",
-        _bi(nd_cur),
-        delta="Positiva (Endividada)" if not np.isnan(nd_cur) and nd_cur > 0 else "Caixa Líquido",
-        delta_color="inverse" if not np.isnan(nd_cur) and nd_cur > 0 else "normal",
-    )
-
-    # ── Gráficos ──────────────────────────────────────────────────────────
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.plotly_chart(chart_leverage(df_q), use_container_width=True)
-    with col_b:
-        st.plotly_chart(chart_capex_da(df_q), use_container_width=True)
-
-    # ── Tabela detalhada ──────────────────────────────────────────────────
-    with st.expander("📋 Ver tabela trimestral completa"):
-        cols_show = [c for c in
-                     ["Date", "Revenue", "EBITDA", "EBIT", "DA",
-                      "Capex", "NetDebt", "Leverage", "NWC"]
-                     if c in df_q.columns]
-        df_disp = df_q[cols_show].copy()
-        for col in ["Revenue", "EBITDA", "EBIT", "DA", "Capex", "NetDebt", "NWC"]:
-            if col in df_disp.columns:
-                df_disp[col] = df_disp[col] / 1e9
-        fmt = {
-            "Revenue": "R$ {:.2f}Bi", "EBITDA": "R$ {:.2f}Bi",
-            "EBIT": "R$ {:.2f}Bi", "DA": "R$ {:.2f}Bi",
-            "Capex": "R$ {:.2f}Bi", "NetDebt": "R$ {:.2f}Bi",
-            "NWC": "R$ {:.2f}Bi", "Leverage": "{:.2f}x",
-        }
-        st.dataframe(
-            df_disp.style.format({k: v for k, v in fmt.items() if k in df_disp.columns}),
-            use_container_width=True,
-        )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# MÓDULO 7 — ABA 2: PREMISSAS
-# ──────────────────────────────────────────────────────────────────────────────
-
-def render_premissas(is_financial: bool) -> Dict[str, Any]:
-    """Aba 2 — Formulário de Premissas para os dois cenários."""
-    st.header("⚙️ Premissas de Projeção")
-
-    macro: Dict[str, float] = st.session_state.get("macro", {})
-    ipca = macro.get("ipca_12m", FALLBACK_IPCA)
-    cdi = macro.get("cdi_anual", FALLBACK_CDI)
-    pib_nom = macro.get("pib_nominal", FALLBACK_PIB_NOMINAL)
-
-    # Valores base do session_state (preenchidos pela Aba 1)
-    last_rev = st.session_state.get("last_revenue", np.nan)
-    last_ebitda = st.session_state.get("last_ebitda", np.nan)
-    last_da = st.session_state.get("last_da", np.nan)
-    last_capex = st.session_state.get("last_capex", np.nan)
-    last_nwc = st.session_state.get("last_nwc", 0.0)
-
-    # Defaults calculados a partir do último trimestre
-    safe_rev = last_rev if (not np.isnan(last_rev) and last_rev > 0) else 1e10
-    safe_ebitda = last_ebitda if (not np.isnan(last_ebitda) and last_ebitda > 0) else 2.5e9
-    safe_da = last_da if (not np.isnan(last_da) and last_da > 0) else 5e8
-    safe_capex = last_capex if (not np.isnan(last_capex) and last_capex > 0) else 6e8
-
-    # Anualizados (× 4 para fluxos de resultado; NWC é saldo, não anualizar)
-    ann_rev = safe_rev * 4
-    ann_ebitda = safe_ebitda * 4
-    ann_da = safe_da * 4
-    ann_capex = safe_capex * 4
-
-    base_margin = ann_ebitda / ann_rev
-    base_capex_pct = ann_capex / ann_rev
-    base_nim = (ann_ebitda * 0.50) / ann_rev   # proxy lucro líquido
-
-    st.info(
-        f"📌 **Base (último trimestre anualizado)** | "
-        f"Receita: R$ {ann_rev/1e9:.2f}Bi | "
-        f"Margem EBITDA: {base_margin:.1%} | "
-        f"Capex/Receita: {base_capex_pct:.1%}"
-    )
-
-    # ── Parâmetros Gerais ─────────────────────────────────────────────────
-    st.markdown("### 🔧 Parâmetros Gerais")
-    cg1, cg2, cg3 = st.columns(3)
-    with cg1:
-        tax_rate = st.number_input(
-            "Alíquota IR + CSLL (%)",
-            min_value=0.0, max_value=50.0,
-            value=34.0, step=0.5,
-            key="tax_rate",
-        ) / 100
-    with cg2:
-        years = st.selectbox(
-            "Período Explícito (anos)",
-            [3, 5, 7],
-            index=0,
-            key="proj_years",
-        )
-    with cg3:
-        da_growth = st.number_input(
-            "Crescimento D&A (% a.a.)",
-            min_value=0.0, max_value=20.0,
-            value=round(ipca * 100, 1),
-            step=0.5,
-            key="da_growth",
-        ) / 100
-
-    if is_financial:
-        net_borrowing = st.number_input(
-            "Net Borrowing Anual (R$ Milhões) — somente FCFE",
-            value=0.0,
-            step=100.0,
-            help="Captação líquida de dívida: nova dívida − amortizações",
-        ) * 1e6
-    else:
-        net_borrowing = 0.0
-
-    st.divider()
-
-    # ── Dois cenários lado a lado ─────────────────────────────────────────
-    col_c, col_m = st.columns(2, gap="large")
-
-    # ─── Cenário Conservador ───────────────────────────────────────────────
-    with col_c:
-        st.markdown(
-            "### 🐢 Cenário Conservador",
-            help="Crescimento limitado ao IPCA, margens pressionadas, WACC estressado",
-        )
-        st.caption("Macro adverso | Sem ganhos de eficiência | Custo de capital elevado")
-
-        cons_rev_g: List[float] = []
-        for y in range(years):
-            v = st.number_input(
-                f"Crescimento Receita Ano {y + 1} (%)",
-                min_value=-20.0, max_value=50.0,
-                value=round(ipca * 100, 1),
-                step=0.5,
-                key=f"c_rev_{y}",
-            ) / 100
-            cons_rev_g.append(v)
-
-        cons_margin = st.slider(
-            "Margem EBITDA (%)",
-            min_value=3.0, max_value=60.0,
-            value=round(max(base_margin * 0.88, 0.08) * 100, 1),
-            step=0.5,
-            key="c_margin",
-        ) / 100
-
-        cons_capex_pct = st.slider(
-            "Capex / Receita (%)",
-            min_value=0.0, max_value=30.0,
-            value=round(min(base_capex_pct * 1.10, 20.0), 1),
-            step=0.5,
-            key="c_capex",
-        ) / 100
-
-        cons_nwc_pct = st.slider(
-            "NWC / Receita (%)",
-            min_value=-10.0, max_value=30.0,
-            value=5.0,
-            step=0.5,
-            key="c_nwc",
-        ) / 100
-
-        cons_wacc = st.slider(
-            "WACC Estressado (%)",
-            min_value=5.0, max_value=30.0,
-            value=round(min(cdi * 100 + 5.0, 20.0), 1),
-            step=0.25,
-            key="c_wacc",
-        ) / 100
-
-        if is_financial:
-            cons_nim = st.slider(
-                "Margem Líquida (%)",
-                min_value=1.0, max_value=40.0,
-                value=round(max(base_nim * 0.85 * 100, 5.0), 1),
-                step=0.5,
-                key="c_nim",
-            ) / 100
-        else:
-            cons_nim = base_nim
-
-    # ─── Cenário Moderado ──────────────────────────────────────────────────
-    with col_m:
-        st.markdown(
-            "### 🚀 Cenário Moderado",
-            help="Crescimento real baseado em pipeline, margens sustentadas, WACC histórico",
-        )
-        st.caption("Crescimento real | Eficiência mantida | Custo de capital histórico")
-
-        mod_rev_g: List[float] = []
-        for y in range(years):
-            v = st.number_input(
-                f"Crescimento Receita Ano {y + 1} (%)",
-                min_value=-20.0, max_value=80.0,
-                value=round(min((ipca + 0.04) * 100, 25.0), 1),
-                step=0.5,
-                key=f"m_rev_{y}",
-            ) / 100
-            mod_rev_g.append(v)
-
-        mod_margin = st.slider(
-            "Margem EBITDA (%)",
-            min_value=3.0, max_value=70.0,
-            value=round(base_margin * 100, 1),
-            step=0.5,
-            key="m_margin",
-        ) / 100
-
-        mod_capex_pct = st.slider(
-            "Capex / Receita (%)",
-            min_value=0.0, max_value=30.0,
-            value=round(base_capex_pct * 100, 1),
-            step=0.5,
-            key="m_capex",
-        ) / 100
-
-        mod_nwc_pct = st.slider(
-            "NWC / Receita (%)",
-            min_value=-10.0, max_value=30.0,
-            value=5.0,
-            step=0.5,
-            key="m_nwc",
-        ) / 100
-
-        mod_wacc = st.slider(
-            "WACC Médio Histórico (%)",
-            min_value=5.0, max_value=25.0,
-            value=round(min(cdi * 100 + 3.0, 16.0), 1),
-            step=0.25,
-            key="m_wacc",
-        ) / 100
-
-        if is_financial:
-            mod_nim = st.slider(
-                "Margem Líquida (%)",
-                min_value=1.0, max_value=40.0,
-                value=round(base_nim * 100, 1),
-                step=0.5,
-                key="m_nim",
-            ) / 100
-        else:
-            mod_nim = base_nim
-
-    # ── Taxa g na Perpetuidade ─────────────────────────────────────────────
-    st.divider()
-    st.markdown("### 🌱 Crescimento na Perpetuidade (g)")
-    g_max = round(pib_nom * 100, 2)
-    g_default = round(min(ipca * 100 + 0.5, g_max), 2)
-
-    g_val = st.slider(
-        f"Taxa g — máximo travado no PIB Nominal estimado ({g_max:.1f}%)",
-        min_value=0.5,
-        max_value=float(g_max),
-        value=float(g_default),
-        step=0.25,
-        help=(
-            f"A taxa de crescimento na perpetuidade não pode exceder o PIB Nominal "
-            f"estimado ({g_max:.1f}%), conforme boas práticas de valuation."
-        ),
-    ) / 100
-
-    return {
-        "years": int(years),
-        "tax_rate": tax_rate,
-        "da_growth": da_growth,
-        "g": g_val,
-        "ann_rev": ann_rev,
-        "ann_da": ann_da,
-        "base_margin": base_margin,
-        "base_nim": base_nim,
-        "last_nwc": last_nwc,
-        "net_borrowing": net_borrowing,
-        # Conservador
-        "cons_rev_g": cons_rev_g,
-        "cons_margin": cons_margin,
-        "cons_capex_pct": cons_capex_pct,
-        "cons_nwc_pct": cons_nwc_pct,
-        "cons_wacc": cons_wacc,
-        "cons_nim": cons_nim,
-        # Moderado
-        "mod_rev_g": mod_rev_g,
-        "mod_margin": mod_margin,
-        "mod_capex_pct": mod_capex_pct,
-        "mod_nwc_pct": mod_nwc_pct,
-        "mod_wacc": mod_wacc,
-        "mod_nim": mod_nim,
-    }
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# MÓDULO 8 — ABA 3: MOTOR DCF
-# ──────────────────────────────────────────────────────────────────────────────
-
-def render_motor_dcf(is_financial: bool) -> None:
-    """Aba 3 — Motor de Fluxo de Caixa Descontado."""
-    st.header("⚡ Motor de Fluxo de Caixa Descontado")
-
-    p: Dict[str, Any] = st.session_state.get("premissas_inputs", {})
-    if not p:
-        st.info("👈 Defina as premissas na Aba 2 primeiro.")
-        return
-
-    net_debt = st.session_state.get("net_debt_ss", 0.0) or 0.0
-    shares = st.session_state.get("shares_outstanding", np.nan)
-
-    if np.isnan(shares) or shares <= 0:
-        st.error(
-            "❌ Número de ações não disponível. "
-            "Verifique se o ticker foi carregado corretamente."
-        )
-        return
-
-    mode = "🏦 FCFE (Instituição Financeira)" if is_financial else "🏭 FCFF (Empresa Real)"
-    st.info(f"**Modo de cálculo:** {mode}")
-
-    # Fórmula exibida
-    if is_financial:
-        st.latex(
-            r"\text{FCFE} = \text{Lucro Líquido} + D\&A - CapEx - \Delta NWC + \text{Net Borrowing}"
-        )
-    else:
-        st.latex(
-            r"\text{FCFF} = EBIT \times (1 - t) + D\&A - CapEx - \Delta NWC"
-        )
-    st.latex(
-        r"TV = \frac{FCF_{t+1}}{WACC - g} \quad \text{(Gordon Growth)}"
-    )
-
-    st.divider()
-
-    # ── Projeção dos FCFs ─────────────────────────────────────────────────
-    nim_cons = [p["cons_nim"]] * p["years"] if is_financial else None
-    nim_mod = [p["mod_nim"]] * p["years"] if is_financial else None
-
-    fcf_cons = project_fcfs(
-        base_revenue=p["ann_rev"],
-        base_da=p["ann_da"],
-        base_capex=0.0,
-        base_nwc=p["last_nwc"],
-        tax_rate=p["tax_rate"],
-        revenue_growth_rates=p["cons_rev_g"],
-        ebitda_margin_path=[p["cons_margin"]] * p["years"],
-        capex_pct_revenue=p["cons_capex_pct"],
-        da_growth_pa=p["da_growth"],
-        nwc_pct_revenue=p["cons_nwc_pct"],
-        is_fcfe=is_financial,
-        net_income_margin_path=nim_cons,
-        net_borrowing=p["net_borrowing"],
-    )
-
-    fcf_mod = project_fcfs(
-        base_revenue=p["ann_rev"],
-        base_da=p["ann_da"],
-        base_capex=0.0,
-        base_nwc=p["last_nwc"],
-        tax_rate=p["tax_rate"],
-        revenue_growth_rates=p["mod_rev_g"],
-        ebitda_margin_path=[p["mod_margin"]] * p["years"],
-        capex_pct_revenue=p["mod_capex_pct"],
-        da_growth_pa=p["da_growth"],
-        nwc_pct_revenue=p["mod_nwc_pct"],
-        is_fcfe=is_financial,
-        net_income_margin_path=nim_mod,
-        net_borrowing=p["net_borrowing"],
-    )
-
-    # ── DCF Engine ────────────────────────────────────────────────────────
-    errors: List[str] = []
-    result_cons: Dict[str, float] = {}
-    result_mod: Dict[str, float] = {}
-
-    try:
-        result_cons = dcf_engine(fcf_cons, p["cons_wacc"], p["g"],
-                                 net_debt, shares, is_financial)
-    except ValueError as exc:
-        errors.append(f"❌ DCF Conservador: {exc}")
-
-    try:
-        result_mod = dcf_engine(fcf_mod, p["mod_wacc"], p["g"],
-                                net_debt, shares, is_financial)
-    except ValueError as exc:
-        errors.append(f"❌ DCF Moderado: {exc}")
-
-    for err in errors:
-        st.error(err)
-    if errors:
-        return
-
-    # Persiste resultados
-    st.session_state["dcf_results"] = {
-        "conservador": result_cons,
-        "moderado": result_mod,
-        "premissas": p,
-        "is_financial": is_financial,
-        "net_debt": net_debt,
-        "shares": shares,
-        "fcf_cons": fcf_cons,
-        "fcf_mod": fcf_mod,
-    }
-
-    # ── Gráfico de projeção ───────────────────────────────────────────────
-    st.plotly_chart(chart_fcf_projection(fcf_cons, fcf_mod, p["years"]),
-                    use_container_width=True)
-
-    # ── Waterfall ─────────────────────────────────────────────────────────
-    c1, c2 = st.columns(2)
-    with c1:
-        st.plotly_chart(
-            chart_waterfall(result_cons, net_debt, "🐢 Conservador"),
-            use_container_width=True,
-        )
-    with c2:
-        st.plotly_chart(
-            chart_waterfall(result_mod, net_debt, "🚀 Moderado"),
-            use_container_width=True,
-        )
-
-    # ── Tabela detalhada ──────────────────────────────────────────────────
-    with st.expander("📊 Detalhamento dos FCFs Projetados (R$ Bilhões)"):
-        year_cols = {f"Ano {i + 1}": [
-            fcf_cons[i] / 1e9, fcf_mod[i] / 1e9
-        ] for i in range(p["years"])}
-        df_det = pd.DataFrame({
-            "Cenário": ["🐢 Conservador", "🚀 Moderado"],
-            **year_cols,
-            "Σ PV FCFs": [result_cons["PV_FCF"] / 1e9, result_mod["PV_FCF"] / 1e9],
-            "PV TV": [result_cons["PV_TV"] / 1e9, result_mod["PV_TV"] / 1e9],
-            "Equity Value": [
-                result_cons["Equity_Value"] / 1e9,
-                result_mod["Equity_Value"] / 1e9,
-            ],
-            "Preço Justo (R$)": [
-                result_cons["Fair_Price"],
-                result_mod["Fair_Price"],
-            ],
-        }).set_index("Cenário")
-        st.dataframe(
-            df_det.style.format({
-                **{c: "{:.2f} Bi" for c in df_det.columns if c != "Preço Justo (R$)"},
-                "Preço Justo (R$)": "R$ {:.2f}",
-            }),
-            use_container_width=True,
-        )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# MÓDULO 9 — ABA 4: OUTPUT & DECISÃO
-# ──────────────────────────────────────────────────────────────────────────────
-
-def render_output() -> None:
-    """Aba 4 — Output Financeiro e Decisão de Investimento."""
-    st.header("💡 Output Financeiro e Decisão de Investimento")
-
-    dcf = st.session_state.get("dcf_results", {})
-    if not dcf:
-        st.info("👈 Execute o DCF na Aba 3 primeiro.")
-        return
-
-    result_cons: Dict[str, float] = dcf["conservador"]
-    result_mod: Dict[str, float] = dcf["moderado"]
-    p: Dict[str, Any] = dcf["premissas"]
-    is_financial: bool = dcf["is_financial"]
-    net_debt: float = dcf["net_debt"]
-    shares: float = dcf["shares"]
-    fcf_cons: List[float] = dcf["fcf_cons"]
-    fcf_mod: List[float] = dcf["fcf_mod"]
-    cdi: float = st.session_state.get("macro", {}).get("cdi_anual", FALLBACK_CDI)
-
-    fp_cons = result_cons.get("Fair_Price", np.nan)
-    fp_mod = result_mod.get("Fair_Price", np.nan)
-    px_atual = st.session_state.get("current_price", np.nan)
-
-    # ── Métricas principais ───────────────────────────────────────────────
-    st.subheader("📌 Preço Justo vs Preço de Tela")
-    col1, col2, col3, col4 = st.columns(4)
-
-    col1.metric(
-        "🐢 Preço Justo Conservador",
-        f"R$ {fp_cons:.2f}" if not np.isnan(fp_cons) else "N/D",
-    )
-    col2.metric(
-        "🚀 Preço Justo Moderado",
-        f"R$ {fp_mod:.2f}" if not np.isnan(fp_mod) else "N/D",
-    )
-    col3.metric(
-        "📌 Preço de Tela Atual",
-        f"R$ {px_atual:.2f}" if not np.isnan(px_atual) else "N/D",
-    )
-
-    ms_pct: float = np.nan
-    if not np.isnan(fp_mod) and not np.isnan(px_atual) and px_atual > 0:
-        ms_pct = (fp_mod - px_atual) / px_atual
-        col4.metric(
-            "🛡️ Margem de Segurança",
-            f"{ms_pct:.1%}",
-            delta="Subavaliado ✅" if ms_pct > 0 else "Sobreavaliado ❌",
-            delta_color="normal" if ms_pct > 0 else "inverse",
-        )
-    else:
-        col4.metric("🛡️ Margem de Segurança", "N/D")
-
-    st.divider()
-
-    # ── TIR Implícita ─────────────────────────────────────────────────────
-    st.subheader("📐 TIR Implícita da Compra ao Preço Atual")
-    st.caption(
-        "Taxa Interna de Retorno que o investidor obteria comprando hoje "
-        "e realizando ao Preço Justo do modelo."
-    )
-
-    if not np.isnan(px_atual) and px_atual > 0 and shares > 0:
-        ti1, ti2 = st.columns(2)
-        for col_ui, fcf_list, wacc_used, label in [
-            (ti1, fcf_cons, p["cons_wacc"], "🐢 Conservador"),
-            (ti2, fcf_mod, p["mod_wacc"], "🚀 Moderado"),
-        ]:
-            try:
-                irr = calc_irr(
-                    current_price=px_atual,
-                    fcf_projections=fcf_list,
-                    g=p["g"],
-                    net_debt=net_debt,
-                    shares=shares,
-                    is_fcfe=is_financial,
-                )
-                spread = irr - cdi if not np.isnan(irr) else np.nan
-                col_ui.metric(
-                    f"TIR — {label}",
-                    f"{irr:.2%}" if not np.isnan(irr) else "N/D",
-                    delta=f"Spread vs CDI: {spread:.2%}" if not np.isnan(spread) else None,
-                    delta_color="normal" if (not np.isnan(spread) and spread > 0) else "inverse",
-                )
-            except Exception as exc:
-                col_ui.metric(f"TIR — {label}", "Erro")
-                col_ui.caption(str(exc))
-    else:
-        st.warning("Preço atual não disponível para cálculo da TIR.")
-
-    st.divider()
-
-    # ── Painel de Decisão ─────────────────────────────────────────────────
-    st.subheader("🎯 Painel de Decisão")
-
-    if not np.isnan(ms_pct) and not np.isnan(px_atual):
-        fp_medio = (
-            (fp_cons + fp_mod) / 2
-            if (not np.isnan(fp_cons) and not np.isnan(fp_mod))
-            else fp_mod
-        )
-
-        if ms_pct > 0.25:
-            verdict = "🟢 COMPRA FORTE"
-            subtext = f"Margem de Segurança confortável de {ms_pct:.1%} (>25%)"
-            bg = "#14532D"
-        elif 0.10 < ms_pct <= 0.25:
-            verdict = "🟡 COMPRA MODERADA"
-            subtext = f"Ativo levemente subavaliado — Margem de {ms_pct:.1%}"
-            bg = "#713F12"
-        elif 0.0 < ms_pct <= 0.10:
-            verdict = "⚪ NEUTRO / ACUMULAR"
-            subtext = f"Preço próximo do valor justo (+{ms_pct:.1%})"
-            bg = "#1E3A5F"
-        elif -0.10 <= ms_pct <= 0.0:
-            verdict = "🟠 NEUTRO / AGUARDAR"
-            subtext = f"Ativo levemente sobreavaliado ({ms_pct:.1%})"
-            bg = "#7C2D12"
-        else:
-            verdict = "🔴 EVITAR / REDUZIR"
-            subtext = f"Ativo significativamente sobreavaliado ({ms_pct:.1%})"
-            bg = "#7F1D1D"
-
-        st.markdown(
-            f"""
-            <div style="
-                background:{bg};
-                padding:24px 32px;
-                border-radius:14px;
-                text-align:center;
-                margin:8px 0;
-            ">
-                <h2 style="color:#FFFFFF;margin:0;letter-spacing:1px">{verdict}</h2>
-                <p style="color:#D1D5DB;margin:10px 0 0;font-size:1rem">{subtext}</p>
-                <p style="color:#94A3B8;margin:6px 0 0;font-size:.9rem">
-                    Preço Atual: <b>R$ {px_atual:.2f}</b> &nbsp;|&nbsp;
-                    Preço Justo (Moderado): <b>R$ {fp_mod:.2f}</b> &nbsp;|&nbsp;
-                    Preço Justo Médio: <b>R$ {fp_medio:.2f}</b>
-                </p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    else:
-        st.warning("Defina o preço atual e os resultados do DCF para ver o painel de decisão.")
-
-    # ── Resumo completo ───────────────────────────────────────────────────
-    with st.expander("📋 Resumo Completo do Modelo de Valuation"):
-        def _fbi(v: float) -> str:
-            return f"R$ {v/1e9:.2f} Bi" if not np.isnan(v) else "N/D"
-
-        rows_summary = {
-            "Parâmetro": [
-                "WACC", "Taxa g",
-                "PV FCFs Explícitos", "PV Valor Terminal",
-                "Enterprise Value", "(−) Dívida Líquida",
-                "Equity Value", "Preço Justo",
-            ],
-            "🐢 Conservador": [
-                f"{p['cons_wacc']:.2%}", f"{p['g']:.2%}",
-                _fbi(result_cons["PV_FCF"]), _fbi(result_cons["PV_TV"]),
-                _fbi(result_cons["Enterprise_Value"]), _fbi(net_debt),
-                _fbi(result_cons["Equity_Value"]),
-                f"R$ {fp_cons:.2f}" if not np.isnan(fp_cons) else "N/D",
-            ],
-            "🚀 Moderado": [
-                f"{p['mod_wacc']:.2%}", f"{p['g']:.2%}",
-                _fbi(result_mod["PV_FCF"]), _fbi(result_mod["PV_TV"]),
-                _fbi(result_mod["Enterprise_Value"]), _fbi(net_debt),
-                _fbi(result_mod["Equity_Value"]),
-                f"R$ {fp_mod:.2f}" if not np.isnan(fp_mod) else "N/D",
-            ],
-        }
-        st.dataframe(
-            pd.DataFrame(rows_summary).set_index("Parâmetro"),
-            use_container_width=True,
-        )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# MÓDULO 10 — ABA 5: SENSIBILIDADE
-# ──────────────────────────────────────────────────────────────────────────────
-
-def render_sensibilidade() -> None:
-    """Aba 5 — Estresse de Modelo / Análise de Sensibilidade."""
-    st.header("🎲 Estresse de Modelo — Análise de Sensibilidade")
-
-    dcf = st.session_state.get("dcf_results", {})
-    if not dcf:
-        st.info("👈 Execute o DCF nas Abas 2–3 primeiro.")
-        return
-
-    p: Dict[str, Any] = dcf["premissas"]
-    is_financial: bool = dcf["is_financial"]
-    net_debt: float = dcf["net_debt"]
-    shares: float = dcf["shares"]
-    px_atual: float = st.session_state.get("current_price", np.nan)
-    macro: Dict[str, float] = st.session_state.get("macro", {})
-    pib_nom: float = macro.get("pib_nominal", FALLBACK_PIB_NOMINAL)
-
-    st.markdown(
-        "Varie o **WACC** (eixo X) e escolha a variável do **eixo Y** "
-        "(Margem EBITDA ou Taxa g) para mapear onde o ativo perde "
-        "a margem de segurança."
-    )
-
-    # ── Configurações da Matriz ───────────────────────────────────────────
-    cf1, cf2 = st.columns(2)
-    with cf1:
-        wacc_min = st.number_input("WACC Mínimo (%)", 5.0, 20.0, 8.0, 0.5) / 100
-        wacc_max = st.number_input("WACC Máximo (%)", 8.0, 30.0, 20.0, 0.5) / 100
-        wacc_steps = st.slider("Pontos no WACC", 3, 10, 7)
-    with cf2:
-        y_mode = st.radio(
-            "Variável no Eixo Y",
-            ["Margem EBITDA", "Taxa g (Perpetuidade)"],
-            horizontal=True,
-            key="y_mode",
-        )
-        if y_mode == "Margem EBITDA":
-            y_min = st.slider("Margem EBITDA Mín (%)", 3.0, 25.0, 8.0, 1.0) / 100
-            y_max = st.slider("Margem EBITDA Máx (%)", 10.0, 60.0, 45.0, 1.0) / 100
-            y_steps = st.slider("Pontos na Margem", 3, 10, 7)
-            y_range = np.linspace(y_min, y_max, y_steps)
-            y_label = "Margem EBITDA"
-            y_axis_key = "ebitda_margin"
-            fixed_g = p["g"]
-            fixed_margin = p["mod_margin"]
-        else:
-            y_min_g = st.slider("g Mínimo (%)", 0.5, 4.0, 1.0, 0.25) / 100
-            y_max_g = st.slider(
-                f"g Máximo (% — PIB Nominal: {pib_nom:.1%})",
-                2.0,
-                round(pib_nom * 100, 1),
-                round(pib_nom * 100, 1),
-                0.25,
-            ) / 100
-            y_steps = st.slider("Pontos em g", 3, 9, 6)
-            y_range = np.linspace(y_min_g, y_max_g, y_steps)
-            y_label = "Taxa g"
-            y_axis_key = "g"
-            fixed_g = p["g"]
-            fixed_margin = p["mod_margin"]
-
-    wacc_range = np.linspace(wacc_min, wacc_max, wacc_steps)
-
-    st.divider()
-    run_btn = st.button("🔥 Calcular Matriz de Sensibilidade", type="primary")
-
-    if run_btn:
-        with st.spinner("Calculando heatmap de sensibilidade..."):
-            df_sens = build_sensitivity(
-                base_revenue=p["ann_rev"],
-                base_da=p["ann_da"],
-                base_nwc=p["last_nwc"],
-                tax_rate=p["tax_rate"],
-                revenue_growth_rates=p["mod_rev_g"],
-                capex_pct=p["mod_capex_pct"],
-                da_growth=p["da_growth"],
-                nwc_pct=p["mod_nwc_pct"],
-                net_debt=net_debt,
-                shares=shares,
-                wacc_range=wacc_range,
-                y_range=y_range,
-                y_axis=y_axis_key,
-                fixed_g=fixed_g,
-                fixed_margin=fixed_margin,
-                current_price=px_atual,
-                is_fcfe=is_financial,
-                base_nim=p["base_nim"],
-            )
-
-        st.plotly_chart(
-            chart_heatmap(df_sens, y_label, px_atual),
-            use_container_width=True,
-        )
-
-        # Contagem de quadrantes
-        total_cells = df_sens.size
-        not_nan = df_sens.notna().sum().sum()
-        is_mos = not np.isnan(px_atual) and px_atual > 0
-        if is_mos:
-            positivos = (df_sens > 0).sum().sum()
-            pct_safe = positivos / not_nan if not_nan > 0 else 0
-            st.info(
-                f"✅ **{positivos}/{not_nan}** combinações ({pct_safe:.0%}) "
-                f"oferecem margem de segurança positiva ao preço atual."
-            )
-
-        with st.expander("📊 Ver dados da matriz"):
-            is_mos2 = not np.isnan(px_atual) and px_atual > 0
-            fmt_dict = {
-                c: "{:.1%}" if is_mos2 else "R$ {:.2f}"
-                for c in df_sens.columns
-            }
-            styled = df_sens.style.format(fmt_dict).background_gradient(
-                cmap="RdYlGn", axis=None, vmin=-0.3, vmax=0.3 if is_mos2 else None
-            )
-            st.dataframe(styled, use_container_width=True)
-
-        st.markdown("""
-        **📖 Como interpretar o heatmap:**
-        - **🟢 Verde** — O preço justo supera o preço atual: há margem de segurança.
-        - **🔴 Vermelho** — O ativo perde a margem de segurança nessas premissas.
-        - Use o heatmap para entender a **robustez** da tese de investimento a variações macro e operacionais.
-        """)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ──────────────────────────────────────────────────────────────────────────────
-
-def main() -> None:
-    """Ponto de entrada principal do aplicativo ValuationB3."""
-    _init_state()
-
-    sidebar = render_sidebar()
-    ticker_yf: str = sidebar["ticker_yf"]
-    is_financial: bool = sidebar["is_financial"]
-
-    # ── Header ────────────────────────────────────────────────────────────
-    col_h, col_p = st.columns([5, 1])
-    with col_h:
-        st.title(f"📊 ValuationB3 — DCF Engine")
-        st.caption(
-            f"Motor de Valuation Fundamentalista para o Mercado Brasileiro (B3)  |  "
-            f"Ativo selecionado: **{sidebar['ticker_raw']}**"
-        )
-
-    # ── Carregamento do ativo ─────────────────────────────────────────────
-    if sidebar["load_btn"]:
-        _reset_state()
-        st.session_state["ticker_yf"] = ticker_yf
-
-        with st.status(f"Carregando {ticker_yf}...", expanded=True) as status:
-            status.write("📡 Consultando yfinance...")
-            info = fetch_info(ticker_yf)
-
-            if not info:
-                st.error(f"❌ Ticker '{ticker_yf}' não encontrado.")
-                status.update(label="Erro", state="error")
-                st.stop()
-
-            px = (
-                info.get("currentPrice")
-                or info.get("regularMarketPrice")
-                or info.get("previousClose")
-            )
-            sh = (
-                info.get("sharesOutstanding")
-                or info.get("impliedSharesOutstanding")
-            )
-
-            st.session_state["current_price"] = float(px) if px else np.nan
-            st.session_state["shares_outstanding"] = float(sh) if sh else np.nan
-            st.session_state["ticker_loaded"] = True
-
-            status.write("📊 Extraindo dados financeiros trimestrais...")
-            df_q = fetch_quarterly(ticker_yf)
-            st.session_state["quarterly_df"] = df_q
-
-            if not df_q.empty:
-                last = df_q.iloc[-1]
-
-                def _s(v: Any) -> float:
-                    return float(v) if pd.notna(v) else np.nan
-
-                st.session_state["last_ebitda"] = _s(last.get("EBITDA"))
-                st.session_state["last_ebit"] = _s(last.get("EBIT"))
-                st.session_state["last_revenue"] = _s(last.get("Revenue"))
-                st.session_state["last_da"] = abs(_s(last.get("DA")) or 0)
-                st.session_state["last_capex"] = abs(_s(last.get("Capex")) or 0)
-                st.session_state["net_debt_ss"] = _s(last.get("NetDebt", 0))
-                st.session_state["last_nwc"] = _s(last.get("NWC")) or 0.0
-                status.write(f"✅ {len(df_q)} trimestres carregados.")
-            else:
-                status.write("⚠️ Dados trimestrais não disponíveis — use upload de RI na Aba 1.")
-
-            nome = info.get("longName", ticker_yf)
-            setor = info.get("sector", "N/D")
-            px_fmt = (
-                f"R$ {st.session_state['current_price']:.2f}"
-                if not np.isnan(st.session_state["current_price"])
-                else "N/D"
-            )
-
-            status.update(
-                label=f"✅ {nome} ({setor}) — Preço Atual: {px_fmt}",
-                state="complete",
-                expanded=False,
-            )
-
-    # ── Abas principais ───────────────────────────────────────────────────
-    if not st.session_state.get("ticker_loaded"):
-        st.info(
-            "👈 **Insira o ticker e clique em 'Carregar Dados do Ativo'** na barra lateral "
-            "para iniciar a análise fundamentalista."
-        )
-        st.markdown("""
-        ### Como usar o ValuationB3:
-        1. **Aba 1 — Diagnóstico**: Revise os últimos 12 trimestres, alavancagem e Capex.
-        2. **Aba 2 — Premissas**: Defina crescimento, margens e WACC para dois cenários.
-        3. **Aba 3 — Motor DCF**: Execute o DCF (FCFF ou FCFE) com Gordon Growth.
-        4. **Aba 4 — Output**: Veja o Preço Justo, TIR implícita e Margem de Segurança.
-        5. **Aba 5 — Sensibilidade**: Explore o heatmap WACC × Margem / g.
-        """)
-        return
-
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "🔬 Diagnóstico",
-        "⚙️ Premissas",
-        "⚡ Motor DCF",
-        "💡 Output & Decisão",
-        "🎲 Sensibilidade",
+        st.caption("Fonte: yFinance · SGS Banco Central do Brasil")
+
+    # ── Session State Init ───────────────────────────────────────────────────
+    for key in (
+        "quarterly_df", "price_info", "macro",
+        "conservative_scenario", "moderate_scenario", "base_inputs",
+        "result_cons", "result_mod", "fair_price_cons", "fair_price_mod",
+        "loaded_ticker",
+    ):
+        if key not in st.session_state:
+            st.session_state[key] = {} if "scenario" in key or key == "base_inputs" \
+                else (pd.DataFrame() if "df" in key else (None if "result" in key else {}))
+
+    # ── Data Loading ─────────────────────────────────────────────────────────
+    ticker_changed = st.session_state.get("loaded_ticker") != selected_ticker
+    if run_btn or ticker_changed:
+        with st.spinner(f"⏳ Carregando dados de {selected_ticker}…"):
+            st.session_state["macro"] = get_macro_indicators()
+            fin_raw = fetch_quarterly_financials(ticker_sa)
+            st.session_state["quarterly_df"] = parse_financial_quarterly(fin_raw)
+            st.session_state["price_info"] = get_current_price(ticker_sa)
+            st.session_state["loaded_ticker"] = selected_ticker
+
+    macro: dict = st.session_state["macro"]
+    quarterly_df: pd.DataFrame = st.session_state.get("quarterly_df", pd.DataFrame())
+    price_info: dict = st.session_state.get("price_info", {})
+
+    ipca = macro.get("ipca_12m", 0.045)
+    selic = macro.get("selic", 0.135)
+    pib_nominal = macro.get("pib_nominal", 0.065)
+
+    # ── Tabs ─────────────────────────────────────────────────────────────────
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "📋 Diagnóstico do Cenário",
+        "🎛️ Premissas de Projeção",
+        "💰 Valuation & Decisão",
+        "🌡️ Sensibilidade",
     ])
 
+    # =========================================================================
+    # ABA 1 — DIAGNÓSTICO DO CENÁRIO ATUAL
+    # =========================================================================
     with tab1:
-        render_diagnostico()
+        st.subheader(f"Diagnóstico Fundamentalista — {selected_ticker}")
 
+        # ── Indicadores Macro ─────────────────────────────────────────────────
+        st.markdown("### 🌐 Indicadores Macroeconômicos (SGS Banco Central)")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("IPCA 12m", f"{ipca:.2%}", help="SGS série 13522")
+        c2.metric("DI Anual", f"{macro.get('di_anual', 0):.2%}", help="SGS série 11")
+        c3.metric("Selic Meta", f"{selic:.2%}", help="SGS série 432")
+        c4.metric(
+            "PIB Nominal Est.",
+            f"{pib_nominal:.2%}",
+            help="IPCA + 2% crescimento real → teto do g",
+        )
+
+        # ── Preço & Market Cap ────────────────────────────────────────────────
+        if price_info.get("price", 0) > 0:
+            st.markdown("### 💹 Mercado")
+            p1, p2, p3 = st.columns(3)
+            p1.metric("Preço Atual", f"R$ {price_info['price']:.2f}")
+            p2.metric(
+                "Market Cap",
+                f"R$ {price_info['market_cap'] / 1e9:.2f}B",
+            )
+            p3.metric(
+                "Ações em Circulação",
+                f"{price_info['shares'] / 1e6:.0f}M",
+            )
+
+        st.divider()
+
+        # ── Upload Fallback ───────────────────────────────────────────────────
+        if quarterly_df.empty:
+            st.warning(
+                "⚠️ Dados financeiros não encontrados via yFinance. "
+                "Faça upload do CSV exportado do RI da empresa."
+            )
+            with st.expander("ℹ️ Formato esperado do CSV", expanded=False):
+                st.markdown(CSV_TEMPLATE_HELP)
+
+            uploaded_file = st.file_uploader(
+                "📂 Upload CSV de Dados Financeiros",
+                type=["csv"],
+                help="Valores em R$ bilhões. Colunas: Date, Revenue, EBITDA, EBIT, DA, Capex, Net_Debt, NWC, Net_Income",
+            )
+            if uploaded_file is not None:
+                try:
+                    df_upload = pd.read_csv(uploaded_file, parse_dates=["Date"])
+                    df_upload = df_upload.set_index("Date").sort_index(ascending=False)
+                    st.session_state["quarterly_df"] = df_upload
+                    quarterly_df = df_upload
+                    st.success(f"✅ {len(quarterly_df)} períodos carregados com sucesso.")
+                except Exception as exc:
+                    st.error(f"Erro ao processar CSV: {exc}")
+
+        # ── Tabela Financeira ─────────────────────────────────────────────────
+        if not quarterly_df.empty:
+            st.markdown("### 📊 Demonstrativos Trimestrais (R$ bi)")
+            show_cols = [
+                c for c in
+                ["Revenue", "EBITDA", "EBIT", "DA", "Capex", "Net_Debt", "NWC", "Net_Income"]
+                if c in quarterly_df.columns
+            ]
+            st.dataframe(
+                quarterly_df[show_cols].style.format("{:.3f}"),
+                use_container_width=True, height=300,
+            )
+
+            st.markdown("### 📈 Gráficos Interativos")
+            g1, g2 = st.columns(2)
+            with g1:
+                st.plotly_chart(plot_leverage_chart(quarterly_df), use_container_width=True)
+            with g2:
+                st.plotly_chart(plot_capex_da_chart(quarterly_df), use_container_width=True)
+
+            st.plotly_chart(plot_ebitda_evolution(quarterly_df), use_container_width=True)
+
+            # Intensidade de Reinvestimento
+            if "Capex" in quarterly_df.columns and "DA" in quarterly_df.columns:
+                capex_ltm = ltm_sum(quarterly_df, "Capex")
+                da_ltm = ltm_sum(quarterly_df, "DA")
+                reinvest_ratio = capex_ltm / max(da_ltm, 1e-6)
+                rev_ltm = ltm_sum(quarterly_df, "Revenue")
+                ebitda_ltm = ltm_sum(quarterly_df, "EBITDA")
+
+                st.markdown("### 🔑 KPIs LTM")
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("Receita LTM", f"R$ {rev_ltm:.2f}B")
+                k2.metric("EBITDA LTM", f"R$ {ebitda_ltm:.2f}B", delta=f"{ebitda_ltm/max(rev_ltm,1e-6):.1%} Mg")
+                k3.metric("CapEx LTM", f"R$ {capex_ltm:.2f}B")
+                k4.metric(
+                    "CapEx / D&A",
+                    f"{reinvest_ratio:.1f}x",
+                    delta="Alto reinvest." if reinvest_ratio > 1.5 else "Baixo reinvest.",
+                    delta_color="off",
+                )
+        else:
+            st.info(
+                "📭 Sem dados financeiros. Clique em **Carregar / Atualizar Dados** "
+                "ou faça upload do CSV."
+            )
+
+    # =========================================================================
+    # ABA 2 — PREMISSAS DE PROJEÇÃO
+    # =========================================================================
     with tab2:
-        premissas = render_premissas(is_financial)
-        st.session_state["premissas_inputs"] = premissas
+        st.subheader("🎛️ Premissas de Projeção — Cenário Conservador & Moderado")
 
+        # ── Dados-Base LTM ────────────────────────────────────────────────────
+        st.markdown("### 📌 Dados-Base LTM (inputs editáveis)")
+
+        rev_ltm_default = max(0.1, round(ltm_sum(quarterly_df, "Revenue"), 2))
+        ebitda_ltm_default = ltm_sum(quarterly_df, "EBITDA")
+        da_ltm_default = max(0.0, round(ltm_sum(quarterly_df, "DA"), 3))
+        capex_ltm_default = max(0.0, round(ltm_sum(quarterly_df, "Capex"), 3))
+        nwc_ltm_default = max(0.0, round(ltm_avg(quarterly_df, "NWC"), 3))
+        nd_ltm_default = round(ltm_avg(quarterly_df, "Net_Debt"), 3)
+        ni_ltm_default = round(ltm_sum(quarterly_df, "Net_Income"), 3)
+
+        margin_default = round(
+            ebitda_ltm_default / max(rev_ltm_default, 1e-6) * 100, 1
+        )
+        capex_pct_default = round(
+            capex_ltm_default / max(rev_ltm_default, 1e-6) * 100, 1
+        )
+
+        bc1, bc2 = st.columns(2)
+        with bc1:
+            base_revenue = st.number_input(
+                "Receita Líquida LTM (R$ bi)", value=rev_ltm_default,
+                min_value=0.01, step=0.1, format="%.3f", key="base_revenue",
+            )
+            base_ebitda_margin = st.number_input(
+                "Margem EBITDA LTM (%)", value=margin_default,
+                min_value=0.0, max_value=100.0, step=0.5, format="%.1f", key="base_ebitda_margin",
+            ) / 100.0
+            base_da = st.number_input(
+                "D&A LTM (R$ bi)", value=da_ltm_default,
+                min_value=0.0, step=0.05, format="%.3f", key="base_da",
+            )
+        with bc2:
+            base_capex_pct = st.number_input(
+                "CapEx / Receita LTM (%)", value=capex_pct_default,
+                min_value=0.0, max_value=100.0, step=0.5, format="%.1f", key="base_capex_pct",
+            ) / 100.0
+            base_nwc = st.number_input(
+                "Capital de Giro Líquido LTM (R$ bi)", value=nwc_ltm_default,
+                min_value=0.0, step=0.1, format="%.3f", key="base_nwc",
+            )
+            net_debt_input = st.number_input(
+                "Dívida Líquida Atual (R$ bi)", value=nd_ltm_default,
+                step=0.1, format="%.3f", key="net_debt_input",
+            )
+
+        st.divider()
+
+        # ── Cenário Conservador ───────────────────────────────────────────────
+        with st.expander("🔴 Cenário Conservador", expanded=True):
+            st.caption(
+                "Crescimento limitado ao IPCA · Opex pressionando margens · WACC estressado"
+            )
+            cc1, cc2, cc3 = st.columns(3)
+            with cc1:
+                st.markdown("**Ano 1**")
+                c_g1 = st.number_input("Crescimento Receita (%)", value=round(ipca * 100, 1), key="c_g1", min_value=-20.0, max_value=50.0, step=0.5) / 100
+                c_m1 = st.number_input("Margem EBITDA (%)", value=max(0.0, margin_default - 1.0), key="c_m1", min_value=0.0, max_value=100.0, step=0.5) / 100
+            with cc2:
+                st.markdown("**Ano 2**")
+                c_g2 = st.number_input("Crescimento Receita (%)", value=round(ipca * 100, 1), key="c_g2", min_value=-20.0, max_value=50.0, step=0.5) / 100
+                c_m2 = st.number_input("Margem EBITDA (%)", value=max(0.0, margin_default - 1.5), key="c_m2", min_value=0.0, max_value=100.0, step=0.5) / 100
+            with cc3:
+                st.markdown("**Ano 3**")
+                c_g3 = st.number_input("Crescimento Receita (%)", value=round(ipca * 100, 1), key="c_g3", min_value=-20.0, max_value=50.0, step=0.5) / 100
+                c_m3 = st.number_input("Margem EBITDA (%)", value=max(0.0, margin_default - 2.0), key="c_m3", min_value=0.0, max_value=100.0, step=0.5) / 100
+
+            cw1, cw2 = st.columns(2)
+            with cw1:
+                wacc_cons = st.number_input(
+                    "WACC Conservador (%)",
+                    value=round((selic + 0.04) * 100, 1),
+                    key="wacc_cons", min_value=5.0, max_value=40.0, step=0.25,
+                ) / 100
+            with cw2:
+                g_cons = st.slider(
+                    "g Perpetuidade Conservador (%)",
+                    min_value=1.0,
+                    max_value=round(min(pib_nominal * 100, (wacc_cons - 0.01) * 100), 1),
+                    value=min(round(ipca * 100, 1), round(pib_nominal * 100, 1)),
+                    step=0.25, key="g_cons",
+                ) / 100
+
+            conservative_scenario = {
+                "revenue_growth": [c_g1, c_g2, c_g3],
+                "ebitda_margin": [c_m1, c_m2, c_m3],
+                "wacc": wacc_cons,
+                "g": g_cons,
+                "da_growth": 0.03,
+                "capex_pct_revenue": base_capex_pct * 1.10,  # capex 10% acima do base
+                "nwc_pct_revenue": base_nwc / max(base_revenue, 1e-6),
+            }
+
+        # ── Cenário Moderado ──────────────────────────────────────────────────
+        with st.expander("🟢 Cenário Moderado", expanded=True):
+            st.caption(
+                "Crescimento real baseado em pipeline · Margens constantes · WACC histórico médio"
+            )
+            cm1, cm2, cm3 = st.columns(3)
+            with cm1:
+                st.markdown("**Ano 1**")
+                m_g1 = st.number_input("Crescimento Receita (%)", value=round(ipca * 100 + 4, 1), key="m_g1", min_value=-20.0, max_value=80.0, step=0.5) / 100
+                m_m1 = st.number_input("Margem EBITDA (%)", value=margin_default, key="m_m1", min_value=0.0, max_value=100.0, step=0.5) / 100
+            with cm2:
+                st.markdown("**Ano 2**")
+                m_g2 = st.number_input("Crescimento Receita (%)", value=round(ipca * 100 + 5, 1), key="m_g2", min_value=-20.0, max_value=80.0, step=0.5) / 100
+                m_m2 = st.number_input("Margem EBITDA (%)", value=margin_default, key="m_m2", min_value=0.0, max_value=100.0, step=0.5) / 100
+            with cm3:
+                st.markdown("**Ano 3**")
+                m_g3 = st.number_input("Crescimento Receita (%)", value=round(ipca * 100 + 5, 1), key="m_g3", min_value=-20.0, max_value=80.0, step=0.5) / 100
+                m_m3 = st.number_input("Margem EBITDA (%)", value=margin_default, key="m_m3", min_value=0.0, max_value=100.0, step=0.5) / 100
+
+            mw1, mw2 = st.columns(2)
+            with mw1:
+                wacc_mod = st.number_input(
+                    "WACC Moderado (%)",
+                    value=round((selic + 0.025) * 100, 1),
+                    key="wacc_mod", min_value=5.0, max_value=40.0, step=0.25,
+                ) / 100
+            with mw2:
+                g_max_mod = round(min(pib_nominal * 100, (wacc_mod - 0.01) * 100), 1)
+                g_mod = st.slider(
+                    "g Perpetuidade Moderado (%)",
+                    min_value=1.0,
+                    max_value=g_max_mod,
+                    value=min(round(ipca * 100 + 1.0, 1), g_max_mod),
+                    step=0.25, key="g_mod",
+                ) / 100
+
+            moderate_scenario = {
+                "revenue_growth": [m_g1, m_g2, m_g3],
+                "ebitda_margin": [m_m1, m_m2, m_m3],
+                "wacc": wacc_mod,
+                "g": g_mod,
+                "da_growth": 0.03,
+                "capex_pct_revenue": base_capex_pct,
+                "nwc_pct_revenue": base_nwc / max(base_revenue, 1e-6),
+            }
+
+        # Persiste no session_state
+        st.session_state["conservative_scenario"] = conservative_scenario
+        st.session_state["moderate_scenario"] = moderate_scenario
+        st.session_state["base_inputs"] = {
+            "base_revenue": base_revenue,
+            "base_ebitda_margin": base_ebitda_margin,
+            "base_da": base_da,
+            "base_capex_pct": base_capex_pct,
+            "base_nwc": base_nwc,
+            "net_debt": net_debt_input,
+            "tax_rate": tax_rate,
+            "ni_ltm": ni_ltm_default,
+            "net_borrowing": 0.0,
+        }
+
+        st.info(
+            f"💡 **g máximo travado ao PIB Nominal estimado ({pib_nominal:.1%})** — "
+            "disciplina do Gordon Growth Model impede crescimento perpétuo acima da economia."
+        )
+
+    # =========================================================================
+    # ABA 3 — VALUATION & DECISÃO
+    # =========================================================================
     with tab3:
-        render_motor_dcf(is_financial)
+        st.subheader("💰 Motor DCF & Output de Decisão de Investimento")
 
+        base_inputs = st.session_state.get("base_inputs", {})
+        cons_scenario = st.session_state.get("conservative_scenario", {})
+        mod_scenario = st.session_state.get("moderate_scenario", {})
+
+        if not base_inputs or not cons_scenario or not mod_scenario:
+            st.warning("⚠️ Configure as premissas na **Aba 2** antes de executar o valuation.")
+            st.stop()
+
+        current_price = price_info.get("price", 0.0)
+        shares_abs = price_info.get("shares", 1.0)
+
+        # ── Executa DCF para os dois cenários ────────────────────────────────
+        result_cons = result_mod = None
+        fair_price_cons = fair_price_mod = 0.0
+
+        with st.spinner("Calculando modelos DCF…"):
+            for label, scenario, key_fp, key_res in [
+                ("Conservador", cons_scenario, "fair_price_cons", "result_cons"),
+                ("Moderado", mod_scenario, "fair_price_mod", "result_mod"),
+            ]:
+                try:
+                    res = run_dcf_projection(
+                        base_revenue=base_inputs["base_revenue"],
+                        base_ebitda_margin=base_inputs["base_ebitda_margin"],
+                        base_da=base_inputs["base_da"],
+                        base_capex_pct_revenue=base_inputs["base_capex_pct"],
+                        base_nwc=base_inputs["base_nwc"],
+                        tax_rate=base_inputs["tax_rate"],
+                        scenario=scenario,
+                        is_financial=is_financial,
+                        base_net_income=base_inputs.get("ni_ltm", 0.0),
+                        base_net_borrowing=base_inputs.get("net_borrowing", 0.0),
+                    )
+                    fp = equity_value_per_share(
+                        res["enterprise_value"],
+                        base_inputs["net_debt"],
+                        shares_abs,
+                        is_financial,
+                    )
+                    st.session_state[key_res] = res
+                    st.session_state[key_fp] = fp
+                except Exception as exc:
+                    st.error(f"Erro no DCF {label}: {exc}")
+
+        result_cons = st.session_state.get("result_cons")
+        result_mod = st.session_state.get("result_mod")
+        fair_price_cons = st.session_state.get("fair_price_cons", 0.0)
+        fair_price_mod = st.session_state.get("fair_price_mod", 0.0)
+
+        # ── KPIs de Decisão ───────────────────────────────────────────────────
+        st.markdown("### 🎯 Preço Justo, TIR & Margem de Segurança")
+
+        safety_margin = (
+            (fair_price_mod / max(current_price, 1e-6) - 1.0) * 100
+            if current_price > 0 else 0.0
+        )
+
+        irr_value = np.nan
+        if result_mod and current_price > 0 and shares_abs > 0:
+            try:
+                irr_value = calculate_implicit_irr(
+                    current_price, shares_abs,
+                    result_mod["fcfs"], result_mod["tv"],
+                )
+            except Exception:
+                pass
+
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("💹 Preço Atual", f"R$ {current_price:.2f}")
+        m2.metric(
+            "🔴 Preço Justo (Cons.)",
+            f"R$ {fair_price_cons:.2f}",
+            delta=f"{(fair_price_cons / max(current_price, 1e-6) - 1) * 100:+.1f}%" if current_price > 0 else None,
+        )
+        m3.metric(
+            "🟢 Preço Justo (Mod.)",
+            f"R$ {fair_price_mod:.2f}",
+            delta=f"{(fair_price_mod / max(current_price, 1e-6) - 1) * 100:+.1f}%" if current_price > 0 else None,
+        )
+        m4.metric(
+            "📐 Margem de Segurança",
+            f"{safety_margin:+.1f}%",
+            delta="Upside" if safety_margin > 0 else "Downside",
+            delta_color="normal" if safety_margin > 0 else "inverse",
+        )
+        m5.metric(
+            "📈 TIR Implícita",
+            f"{irr_value:.1%}" if not np.isnan(irr_value) else "N/D",
+            delta=f"WACC Mod: {mod_scenario.get('wacc', 0):.1%}" if not np.isnan(irr_value) else None,
+        )
+
+        # ── Veredicto de Investimento ─────────────────────────────────────────
+        if current_price > 0 and fair_price_mod > 0:
+            if safety_margin > 30:
+                vc, vt = "#00CC96", "🚀 COMPRA FORTE — Margem de Segurança expressiva (>30%)"
+            elif safety_margin > 15:
+                vc, vt = "#ADFF2F", "✅ COMPRA — Ativo abaixo do valor justo moderado"
+            elif safety_margin > -10:
+                vc, vt = "#FFA500", "⚖️ NEUTRO — Ativo precificado próximo ao valor justo"
+            else:
+                vc, vt = "#EF553B", "❌ AGUARDAR / VENDA — Ativo acima do valor justo"
+
+            st.markdown(
+                f"""
+                <div style='background:{vc}1a; border-left:4px solid {vc};
+                     padding:12px 20px; border-radius:6px; margin:12px 0;'>
+                  <strong style='color:{vc}; font-size:1.05rem;'>{vt}</strong><br>
+                  <span style='color:#ccc; font-size:0.9rem;'>
+                    Preço Atual: R${current_price:.2f} &nbsp;|&nbsp;
+                    Justo Mod.: R${fair_price_mod:.2f} &nbsp;|&nbsp;
+                    MS: {safety_margin:+.1f}% &nbsp;|&nbsp;
+                    TIR: {"N/D" if np.isnan(irr_value) else f"{irr_value:.1%}"}
+                  </span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        st.divider()
+
+        # ── Projeções Lado a Lado ─────────────────────────────────────────────
+        st.markdown("### 📋 Projeções Detalhadas por Cenário")
+        col_l, col_r = st.columns(2)
+
+        for col, label, result, wacc, fp in [
+            (col_l, "🔴 Conservador", result_cons, cons_scenario.get("wacc", 0), fair_price_cons),
+            (col_r, "🟢 Moderado", result_mod, mod_scenario.get("wacc", 0), fair_price_mod),
+        ]:
+            with col:
+                st.markdown(f"#### {label}")
+                if result:
+                    df_proj = result["projections"].copy()
+                    # Formata porcentagem
+                    df_display = df_proj.copy()
+                    if "Margem EBITDA" in df_display.columns:
+                        df_display["Margem EBITDA"] = df_display["Margem EBITDA"].map("{:.1%}".format)
+
+                    st.dataframe(
+                        df_display.style.format(
+                            {c: "R${:.3f}B" for c in df_proj.columns if "R$bi" in c or "bi)" in c}
+                        ),
+                        use_container_width=True, height=180,
+                    )
+
+                    ev = result["enterprise_value"]
+                    nd = base_inputs.get("net_debt", 0)
+                    equity_bi = max(ev - nd, 0) if not is_financial else ev
+
+                    st.markdown(
+                        f"""
+                        | | R$ bi |
+                        |---|---|
+                        | PV FCFs Explícitos | {result['pv_fcfs']:.3f} |
+                        | Valor Terminal (TV) | {result['tv']:.3f} |
+                        | PV do TV | {result['pv_tv']:.3f} |
+                        | **Enterprise Value** | **{ev:.3f}** |
+                        | (−) Dívida Líquida | {nd:.3f} |
+                        | **Equity Value** | **{equity_bi:.3f}** |
+                        | **Preço Justo/Ação** | **R$ {fp:.2f}** |
+                        """
+                    )
+
+        # ── Gráficos: FCF Projetado + Waterfall ──────────────────────────────
+        if result_cons and result_mod:
+            df_fcf = pd.DataFrame(
+                {
+                    "Ano": ["Ano 1", "Ano 2", "Ano 3"],
+                    "FCF Conservador": result_cons["fcfs"],
+                    "FCF Moderado": result_mod["fcfs"],
+                }
+            )
+            fig_bar = px.bar(
+                df_fcf, x="Ano",
+                y=["FCF Conservador", "FCF Moderado"],
+                barmode="group",
+                title="FCF Projetado — Conservador vs. Moderado (R$ bi)",
+                color_discrete_map={
+                    "FCF Conservador": "#EF553B",
+                    "FCF Moderado": "#00CC96",
+                },
+                labels={"value": "R$ bi", "variable": "Cenário"},
+                template="plotly_dark",
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+            wf1, wf2 = st.columns(2)
+            with wf1:
+                st.plotly_chart(
+                    plot_ev_waterfall(result_cons, "Conservador", cons_scenario.get("wacc", 0.15)),
+                    use_container_width=True,
+                )
+            with wf2:
+                st.plotly_chart(
+                    plot_ev_waterfall(result_mod, "Moderado", mod_scenario.get("wacc", 0.13)),
+                    use_container_width=True,
+                )
+
+            # Fórmula exibida
+            fcf_type = "FCFE" if is_financial else "FCFF"
+            formula = (
+                "FCFE = Net Income + D&A − CapEx − ΔNWC + Net Borrowing"
+                if is_financial
+                else "FCFF = EBIT × (1 − t) + D&A − CapEx − ΔNWC"
+            )
+            st.info(
+                f"**Metodologia:** {fcf_type} · Perpetuidade de Gordon: "
+                f"TV = FCF_{{t+1}} / (WACC − g) · {formula}"
+            )
+
+    # =========================================================================
+    # ABA 4 — SENSIBILIDADE (HEATMAP)
+    # =========================================================================
     with tab4:
-        render_output()
+        st.subheader("🌡️ Análise de Sensibilidade — Matriz de Preços Justos")
 
-    with tab5:
-        render_sensibilidade()
+        base_inputs = st.session_state.get("base_inputs", {})
+        mod_scenario = st.session_state.get("moderate_scenario", {})
+
+        if not base_inputs or not mod_scenario:
+            st.warning("⚠️ Configure as premissas na **Aba 2** antes de executar a sensibilidade.")
+            st.stop()
+
+        s1, s2 = st.columns([1, 2])
+        with s1:
+            sens_y = st.radio(
+                "Eixo Y da Matriz",
+                options=["g — Taxa de Perpetuidade", "Margem EBITDA"],
+                index=0,
+            )
+            y_key = "g" if "g" in sens_y else "ebitda_margin"
+
+            st.markdown(
+                f"""
+                **Configuração da Iteração:**
+                - Eixo X (WACC): ±4pp em torno de {mod_scenario.get('wacc', 0):.1%}
+                - Eixo Y ({'g' if y_key=='g' else 'Margem'}): ±3pp em torno do valor base
+                - Passo: 1pp
+                """
+            )
+            run_sens = st.button(
+                "▶️ Calcular Sensibilidade", type="primary", use_container_width=True
+            )
+
+        with s2:
+            st.info(
+                "**Como ler o heatmap:**  \n"
+                "Cada célula mostra o **Preço Justo (R$)** e a **Margem de Segurança (%)** "
+                "em relação ao preço atual para aquela combinação de WACC e parâmetro Y.  \n"
+                "🟢 Verde = Upside · 🔴 Vermelho = Downside"
+            )
+
+        if run_sens:
+            with st.spinner("⏳ Calculando matriz (~15s)…"):
+                try:
+                    matrix = build_sensitivity_matrix(
+                        base_revenue=base_inputs["base_revenue"],
+                        base_ebitda_margin=base_inputs["base_ebitda_margin"],
+                        base_da=base_inputs["base_da"],
+                        base_capex_pct=base_inputs["base_capex_pct"],
+                        base_nwc=base_inputs["base_nwc"],
+                        tax_rate=base_inputs["tax_rate"],
+                        revenue_growth=mod_scenario["revenue_growth"],
+                        g_base=mod_scenario["g"],
+                        wacc_base=mod_scenario["wacc"],
+                        net_debt=base_inputs["net_debt"],
+                        shares_outstanding=price_info.get("shares", 1.0),
+                        current_price=price_info.get("price", 1.0),
+                        is_financial=is_financial,
+                        sensitivity_y=y_key,
+                    )
+
+                    cp = price_info.get("price", 1.0)
+                    y_title = "g (Perpetuidade)" if y_key == "g" else "Margem EBITDA"
+                    matrix.index.name = y_title
+
+                    fig_heat = plot_sensitivity_heatmap(
+                        matrix,
+                        cp,
+                        f"Sensibilidade: WACC × {y_title} → Preço Justo (R$) | {selected_ticker}",
+                    )
+                    st.plotly_chart(fig_heat, use_container_width=True)
+
+                    # Tabela com gradiente
+                    st.markdown("#### 📋 Tabela de Preços Justos (R$)")
+                    st.dataframe(
+                        matrix.style.background_gradient(
+                            cmap="RdYlGn", axis=None
+                        ).format("{:.2f}", na_rep="N/D"),
+                        use_container_width=True,
+                    )
+
+                    # Análise dos quadrantes
+                    n_total = int(matrix.notna().sum().sum())
+                    n_above_15 = int((matrix > cp * 1.15).sum().sum())
+                    n_above_0 = int((matrix > cp).sum().sum())
+                    pct_15 = n_above_15 / max(n_total, 1) * 100
+                    pct_0 = n_above_0 / max(n_total, 1) * 100
+
+                    qa, qb, qc = st.columns(3)
+                    qa.metric(
+                        "✅ Quadrantes c/ MS > 15%",
+                        f"{n_above_15}/{n_total}",
+                        delta=f"{pct_15:.0f}% do total",
+                    )
+                    qb.metric(
+                        "🟡 Quadrantes c/ Upside > 0",
+                        f"{n_above_0}/{n_total}",
+                        delta=f"{pct_0:.0f}% do total",
+                    )
+                    qc.metric(
+                        "🔴 Quadrantes em Downside",
+                        f"{n_total - n_above_0}/{n_total}",
+                        delta=f"{100 - pct_0:.0f}% do total",
+                        delta_color="inverse",
+                    )
+
+                except Exception as exc:
+                    st.error(f"Erro na análise de sensibilidade: {exc}")
+                    st.exception(exc)
 
 
 if __name__ == "__main__":
