@@ -1,798 +1,1789 @@
-import streamlit as st
-import pandas as pd
+"""
+ValuationB3 — Motor de DCF Fundamentalista para o Mercado Brasileiro (B3)
+=========================================================================
+Desenvolvido para Streamlit Cloud | v1.0
+Arquitetura: Modular, PEP-8, @st.cache_data, st.session_state
+
+Pilares:
+  1. Diagnóstico do Cenário Atual   (Aba 1)
+  2. Premissas de Projeção          (Aba 2)
+  3. Motor DCF (FCFF / FCFE)        (Aba 3)
+  4. Output Financeiro e Decisão    (Aba 4)
+  5. Análise de Sensibilidade       (Aba 5)
+"""
+
+from __future__ import annotations
+
+import warnings
+from typing import Any, Dict, List, Optional
+
 import numpy as np
-import yfinance as yf
-import statsmodels.api as sm
-import plotly.express as px
+import pandas as pd
 import plotly.graph_objects as go
 import requests
-from datetime import datetime, timedelta
-import time
+import streamlit as st
+import yfinance as yf
+from scipy.optimize import brentq
 
-# ==============================================================================
+warnings.filterwarnings("ignore")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CONSTANTES
+# ──────────────────────────────────────────────────────────────────────────────
+
+SGS_BASE = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.{}/dados/ultimos/{}?formato=json"
+SGS_IPCA = 433        # IPCA mensal
+SGS_CDI = 4391        # CDI acumulado 12 meses
+SGS_SELIC = 432       # Meta SELIC anualizada
+
+FALLBACK_IPCA = 0.045
+FALLBACK_CDI = 0.107
+FALLBACK_SELIC = 0.105
+FALLBACK_PIB_NOMINAL = 0.085   # IPCA + crescimento real estimado
+PIB_REAL_ESTIMATE = 0.020      # crescimento real estimado do PIB
+
+CHART_BG = "#0F172A"
+CHART_PAPER = "#0F172A"
+CHART_FONT = "#E2E8F0"
+
+# ──────────────────────────────────────────────────────────────────────────────
 # CONFIGURAÇÃO DA PÁGINA
-# ==============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
+
 st.set_page_config(
-    page_title="Quant Factor Lab Pro v3.7 (Full Hybrid)",
+    page_title="ValuationB3 | DCF Engine",
+    page_icon="📊",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# Constantes
-BRAPI_TOKEN = "5gVedSQ928pxhFuTvBFPfr"
+_CSS = """
+<style>
+  [data-testid="stSidebar"]        { background:#0F172A; }
+  .stMetricValue                   { font-size:1.35rem !important; font-weight:700; }
+  .stMetricLabel                   { font-size:.78rem !important; color:#94A3B8; }
+  .stTabs [data-baseweb="tab"]     { background:#1E293B; border-radius:8px;
+                                     padding:8px 18px; color:#94A3B8; }
+  .stTabs [aria-selected="true"]   { background:#3B82F6 !important; color:#fff !important; }
+  div[data-testid="stExpander"]    { border:1px solid #1E293B; border-radius:8px; }
+</style>
+"""
+st.markdown(_CSS, unsafe_allow_html=True)
 
-# ==============================================================================
-# MÓDULO 1: DATA FETCHING (HÍBRIDO: BRAPI + YFINANCE FALLBACK)
-# ==============================================================================
 
-@st.cache_data(ttl=3600*12)
-def fetch_price_data(tickers: list, start_date: str, end_date: str) -> pd.DataFrame:
-    """Busca histórico de preços ajustados via YFinance."""
-    t_list = list(tickers)
-    # Garante benchmarks
-    for bench in ['BOVA11.SA', 'DIVO11.SA']:
-        if bench not in t_list:
-            t_list.append(bench)
-    
+# ──────────────────────────────────────────────────────────────────────────────
+# SESSION STATE
+# ──────────────────────────────────────────────────────────────────────────────
+
+_STATE_DEFAULTS: Dict[str, Any] = {
+    "ticker_loaded": False,
+    "ticker_yf": "",
+    "quarterly_df": pd.DataFrame(),
+    "macro": {},
+    "current_price": np.nan,
+    "shares_outstanding": np.nan,
+    "net_debt_ss": np.nan,
+    "last_ebitda": np.nan,
+    "last_ebit": np.nan,
+    "last_revenue": np.nan,
+    "last_da": np.nan,
+    "last_capex": np.nan,
+    "last_nwc": 0.0,
+    "dcf_results": {},
+    "premissas_inputs": {},
+}
+
+
+def _init_state() -> None:
+    """Inicializa session_state com valores padrão se ausentes."""
+    for key, val in _STATE_DEFAULTS.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
+
+
+def _reset_state() -> None:
+    """Reinicia estado ao trocar de ticker."""
+    for key, val in _STATE_DEFAULTS.items():
+        st.session_state[key] = val
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MÓDULO 1 — DATA FETCHING
+# ──────────────────────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=3600 * 6, show_spinner=False)
+def _sgs(series_id: int, n: int = 12) -> pd.DataFrame:
+    """Consome a API do SGS do Banco Central do Brasil."""
     try:
-        data = yf.download(
-            t_list, 
-            start=start_date, 
-            end=end_date, 
-            progress=False,
-            auto_adjust=False,
-            threads=True
-        )['Adj Close']
-        
-        if isinstance(data, pd.Series):
-            data = data.to_frame()
-            
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
-            
-        data = data.dropna(axis=1, how='all')
-        return data
-    except Exception as e:
-        st.error(f"Erro crítico ao baixar preços YF: {e}")
-        return pd.DataFrame()
+        resp = requests.get(SGS_BASE.format(series_id, n), timeout=12)
+        resp.raise_for_status()
+        df = pd.DataFrame(resp.json())
+        df["data"] = pd.to_datetime(df["data"], format="%d/%m/%Y")
+        df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
+        return df
+    except Exception as exc:  # noqa: BLE001
+        st.toast(f"⚠️ SGS série {series_id}: {exc}", icon="⚠️")
+        return pd.DataFrame(columns=["data", "valor"])
 
-@st.cache_data(ttl=3600*4)
-def fetch_fundamentals_hybrid(tickers: list, token: str) -> pd.DataFrame:
+
+@st.cache_data(ttl=3600 * 6, show_spinner=False)
+def fetch_macro() -> Dict[str, float]:
     """
-    Busca fundamentos. Tenta Brapi primeiro. 
-    Se faltar dados (P/VP, ROE, etc.), preenche com YFinance (.info).
+    Retorna dict com indicadores macroeconômicos atuais via SGS/BCB.
+    Fallbacks automáticos se a API falhar.
     """
-    # Limpa tickers para o formato Brapi (sem .SA)
-    clean_tickers = [t.replace('.SA', '') for t in tickers if 'BOVA11' not in t and 'DIVO11' not in t]
-    
-    if not clean_tickers:
-        return pd.DataFrame()
+    macro: Dict[str, float] = {}
 
-    fundamental_data = []
-    
-    # UI Feedback
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    total_tickers = len(clean_tickers)
-    
-    def safe_float(val):
-        if val is None or val == '' or str(val).lower() == 'nan': return np.nan
-        try:
-            return float(val)
-        except:
-            return np.nan
+    # IPCA — acumulado 12 meses
+    df_ipca = _sgs(SGS_IPCA, 12)
+    if not df_ipca.empty and df_ipca["valor"].notna().any():
+        macro["ipca_12m"] = float((1 + df_ipca["valor"].dropna() / 100).prod() - 1)
+    else:
+        macro["ipca_12m"] = FALLBACK_IPCA
 
-    def get_nested_val(item, keys_list):
-        # Busca recursiva simples em JSON
-        for key in keys_list:
-            if key in item and item[key] is not None:
-                return item[key]
-        # Tenta subníveis comuns
-        for module in ['defaultKeyStatistics', 'financialData', 'summaryProfile', 'price']:
-            if module in item and isinstance(item[module], dict):
-                for key in keys_list:
-                    if key in item[module]:
-                        return item[module][key]
-        return None
+    # CDI anual
+    df_cdi = _sgs(SGS_CDI, 1)
+    if not df_cdi.empty and df_cdi["valor"].notna().any():
+        macro["cdi_anual"] = float(df_cdi["valor"].dropna().iloc[-1] / 100)
+    else:
+        macro["cdi_anual"] = FALLBACK_CDI
 
-    for i, ticker in enumerate(clean_tickers):
-        # 1. TENTATIVA VIA BRAPI
-        status_text.text(f"Analisando: {ticker} ({i+1}/{total_tickers}) - Fonte: Brapi...")
-        
-        # Inicializa variáveis com NaN
-        price = market_cap = pe_ratio = p_vp = ev_ebitda = roe = net_margin = np.nan
-        sector = 'Outros'
-        
-        url = f"https://brapi.dev/api/quote/{ticker}"
-        params = {'token': token, 'fundamental': 'true'}
-        
-        try:
-            response = requests.get(url, params=params, timeout=10)
-            if response.status_code == 200:
-                data_json = response.json()
-                results = data_json.get('results', [])
-                if results:
-                    item = results[0]
-                    
-                    price = safe_float(item.get('regularMarketPrice'))
-                    market_cap = safe_float(item.get('marketCap'))
-                    sector = item.get('sector') or item.get('summaryProfile', {}).get('sector', 'Outros')
-                    
-                    pe_ratio = safe_float(get_nested_val(item, ['priceEarnings', 'trailingPE', 'peRatio']))
-                    p_vp = safe_float(get_nested_val(item, ['priceToBook', 'priceToBookRatio', 'p_vp']))
-                    ev_ebitda = safe_float(get_nested_val(item, ['enterpriseToEbitda', 'enterpriseValueToEBITDA', 'ev_ebitda']))
-                    roe = safe_float(get_nested_val(item, ['returnOnEquity', 'roe']))
-                    net_margin = safe_float(get_nested_val(item, ['profitMargin', 'netMargin', 'netProfitMargin']))
+    # SELIC meta
+    df_selic = _sgs(SGS_SELIC, 1)
+    if not df_selic.empty and df_selic["valor"].notna().any():
+        macro["selic"] = float(df_selic["valor"].dropna().iloc[-1] / 100)
+    else:
+        macro["selic"] = FALLBACK_SELIC
 
-        except Exception:
-            pass # Falha na Brapi, segue para Fallback silenciosamente
+    # PIB nominal estimado = IPCA + crescimento real
+    macro["pib_nominal"] = macro["ipca_12m"] + PIB_REAL_ESTIMATE
 
-        # 2. VERIFICAÇÃO E FALLBACK VIA YFINANCE
-        # Se P/VP ou ROE estiverem vazios, acionamos o Yahoo
-        if np.isnan(p_vp) or np.isnan(roe) or np.isnan(ev_ebitda):
-            status_text.text(f"Complementando dados: {ticker} via Yahoo Finance...")
-            try:
-                yf_t = yf.Ticker(f"{ticker}.SA")
-                info = yf_t.info
-                
-                if np.isnan(price): price = info.get('currentPrice') or info.get('previousClose')
-                if np.isnan(market_cap): market_cap = info.get('marketCap')
-                if sector == 'Outros': sector = info.get('sector', 'Outros')
-                
-                if np.isnan(pe_ratio): pe_ratio = info.get('trailingPE')
-                if np.isnan(p_vp): p_vp = info.get('priceToBook')
-                if np.isnan(ev_ebitda): ev_ebitda = info.get('enterpriseToEbitda')
-                if np.isnan(roe): roe = info.get('returnOnEquity')
-                if np.isnan(net_margin): net_margin = info.get('profitMargins')
-                
-            except Exception:
-                pass
-        
-        fundamental_data.append({
-            'ticker': f"{ticker}.SA", # Normaliza saída para .SA
-            'sector': sector,
-            'currentPrice': price,
-            'marketCap': market_cap,
-            'PE': pe_ratio,
-            'P_VP': p_vp,
-            'EV_EBITDA': ev_ebitda,
-            'ROE': roe,
-            'Net_Margin': net_margin,
-        })
-        
-        progress_bar.progress((i + 1) / total_tickers)
-        time.sleep(0.5)
+    return macro
 
-    progress_bar.empty()
-    status_text.empty()
-    
-    df = pd.DataFrame(fundamental_data)
-    if not df.empty:
-        df = df.drop_duplicates(subset=['ticker'])
-        df = df.set_index('ticker')
-        
-        # Limpeza final de zeros
-        cols_check = ['PE', 'P_VP', 'EV_EBITDA', 'ROE', 'Net_Margin']
-        for col in cols_check:
-            if col in df.columns:
-                df[col] = df[col].replace([0, 0.0], np.nan)
-            
-    return df
 
-# ==============================================================================
-# MÓDULO 2: CÁLCULO DE FATORES
-# ==============================================================================
-
-def compute_residual_momentum_enhanced(price_df: pd.DataFrame, lookback=12, skip=1) -> pd.Series:
-    """Residual Momentum (Blitz) com Volatility Scaling."""
-    df = price_df.copy()
-    monthly = df.resample('ME').last() 
-    rets = monthly.pct_change().dropna()
-    
-    if 'BOVA11.SA' not in rets.columns: return pd.Series(dtype=float)
-        
-    market = rets['BOVA11.SA']
-    scores = {}
-    
-    regression_window = 36 
-    
-    for ticker in rets.columns:
-        if ticker in ['BOVA11.SA', 'DIVO11.SA']: continue
-        
-        y_full = rets[ticker].tail(regression_window + skip)
-        x_full = market.tail(regression_window + skip)
-        
-        if len(y_full) < 12: continue
-            
-        try:
-            common_idx = y_full.index.intersection(x_full.index)
-            y_full = y_full.loc[common_idx]
-            x_full = x_full.loc[common_idx]
-
-            X = sm.add_constant(x_full.values)
-            model = sm.OLS(y_full.values, X).fit()
-            residuals = pd.Series(model.resid, index=y_full.index)
-            
-            resid_12m = residuals.iloc[-(12 + skip) : -skip]
-            
-            if len(resid_12m) == 0:
-                scores[ticker] = 0
-                continue
-
-            raw_momentum = resid_12m.sum()
-            resid_vol = residuals.std()
-            
-            if resid_vol == 0:
-                scores[ticker] = 0
-            else:
-                scores[ticker] = raw_momentum / resid_vol 
-        except:
-            scores[ticker] = 0
-            
-    return pd.Series(scores, name='Residual_Momentum')
-
-def compute_value_robust(fund_df: pd.DataFrame) -> pd.Series:
-    """Composite Value Score."""
-    scores = pd.DataFrame(index=fund_df.index)
-    
-    def invert_metric(series):
-        return 1.0 / series.replace(0, np.nan)
-
-    if 'PE' in fund_df: scores['Earnings_Yield'] = invert_metric(fund_df['PE'])
-    if 'P_VP' in fund_df: scores['Book_Yield'] = invert_metric(fund_df['P_VP'])
-    if 'EV_EBITDA' in fund_df: scores['EBITDA_Yield'] = invert_metric(fund_df['EV_EBITDA'])
-
-    if scores.empty or scores.dropna(how='all').empty:
-        return pd.Series(0, index=fund_df.index, name="Value_Score")
-
-    for col in scores.columns:
-        filled = scores[col].fillna(scores[col].median())
-        if filled.std() > 0:
-            scores[col] = (filled - filled.mean()) / filled.std()
-        else:
-            scores[col] = 0
-
-    return scores.mean(axis=1).rename("Value_Score")
-
-def compute_quality_score(fund_df: pd.DataFrame) -> pd.Series:
-    """Composite Quality Score."""
-    scores = pd.DataFrame(index=fund_df.index)
-    
-    if 'ROE' in fund_df: scores['ROE'] = fund_df['ROE']
-    if 'Net_Margin' in fund_df: scores['Margin'] = fund_df['Net_Margin']
-
-    if scores.empty or scores.dropna(how='all').empty:
-        return pd.Series(0, index=fund_df.index, name="Quality_Score")
-    
-    for col in scores.columns:
-        filled = scores[col].fillna(scores[col].median())
-        if filled.std() > 0:
-            scores[col] = (filled - filled.mean()) / filled.std()
-        else:
-            scores[col] = 0
-            
-    return scores.mean(axis=1).rename("Quality_Score")
-
-# ==============================================================================
-# MÓDULO 3: MATEMÁTICA E MÉTRICAS
-# ==============================================================================
-
-def robust_zscore(series: pd.Series) -> pd.Series:
-    series = series.replace([np.inf, -np.inf], np.nan)
-    median = series.median()
-    mad = (series - median).abs().median()
-    if mad == 0 or mad < 1e-6: return series - median 
-    z = (series - median) / (mad * 1.4826) 
-    return z.clip(-3, 3) 
-
-def calculate_advanced_metrics(prices_series: pd.Series, risk_free_rate_annual: float = 0.10):
-    if prices_series.empty or len(prices_series) < 2:
+@st.cache_data(ttl=3600 * 12, show_spinner=False)
+def fetch_info(ticker_yf: str) -> Dict[str, Any]:
+    """Busca metadados do ativo via yfinance."""
+    try:
+        return yf.Ticker(ticker_yf).info or {}
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Erro ao buscar info de {ticker_yf}: {exc}")
         return {}
-    
-    daily_rets = prices_series.pct_change().dropna()
-    if daily_rets.empty: return {}
-    
-    total_ret = (prices_series.iloc[-1] / prices_series.iloc[0]) - 1
-    days = (prices_series.index[-1] - prices_series.index[0]).days
-    cagr = (1 + total_ret)**(365/days) - 1 if days > 0 else 0
-    vol_ann = daily_rets.std() * np.sqrt(252)
-    
-    rf_daily = (1 + risk_free_rate_annual)**(1/252) - 1
-    excess_rets = daily_rets - rf_daily
-    sharpe = (excess_rets.mean() * 252) / (daily_rets.std() * np.sqrt(252)) if daily_rets.std() > 0 else 0
-    
-    downside_rets = excess_rets[excess_rets < 0]
-    downside_std = downside_rets.std() * np.sqrt(252)
-    sortino = (excess_rets.mean() * 252) / downside_std if (downside_std > 0 and not np.isnan(downside_std)) else 0
-    
-    cum_rets = (1 + daily_rets).cumprod()
-    peak = cum_rets.cummax()
-    drawdown = (cum_rets - peak) / peak
-    max_dd = drawdown.min()
-    calmar = cagr / abs(max_dd) if max_dd != 0 else 0
-    ulcer_index = np.sqrt((drawdown**2).mean())
-    
+
+
+@st.cache_data(ttl=3600 * 12, show_spinner=False)
+def fetch_quarterly(ticker_yf: str) -> pd.DataFrame:
+    """
+    Extrai até 12 trimestres de dados financeiros consolidados:
+    Revenue, EBIT, EBITDA, D&A, Capex, NetDebt, NWC.
+
+    Fontes: quarterly_financials, quarterly_balance_sheet, quarterly_cashflow
+    via yfinance.  Retorna DataFrame ordenado do mais antigo ao mais recente.
+    """
+    def _get(df: pd.DataFrame, keys: List[str], col: Any) -> float:
+        """Busca segura em DataFrame transposto do yfinance."""
+        for k in keys:
+            try:
+                if k in df.index and col in df.columns:
+                    v = df.loc[k, col]
+                    if pd.notna(v):
+                        return float(v)
+            except Exception:
+                continue
+        return np.nan
+
+    try:
+        t = yf.Ticker(ticker_yf)
+        fin = t.quarterly_financials
+        bs = t.quarterly_balance_sheet
+        cf = t.quarterly_cashflow
+
+        if fin is None or fin.empty:
+            return pd.DataFrame()
+
+        dates = fin.columns.tolist()[:12]
+        rows: List[Dict[str, Any]] = []
+
+        for d in dates:
+            row: Dict[str, Any] = {"Date": d}
+
+            # ── DRE ──────────────────────────────────────────────────────────
+            row["Revenue"] = _get(fin, [
+                "Total Revenue", "Revenue", "Net Revenue",
+            ], d)
+            row["EBIT"] = _get(fin, [
+                "EBIT", "Operating Income",
+            ], d)
+            row["Net_Income"] = _get(fin, [
+                "Net Income", "Net Income Common Stockholders",
+            ], d)
+
+            # ── FLUXO DE CAIXA ────────────────────────────────────────────
+            row["DA"] = _get(cf, [
+                "Depreciation And Amortization",
+                "Depreciation Amortization Depletion",
+                "Depreciation",
+            ], d)
+            if np.isnan(row["DA"]):
+                row["DA"] = _get(fin, [
+                    "Reconciled Depreciation", "Depreciation",
+                ], d)
+
+            raw_capex = _get(cf, [
+                "Capital Expenditure",
+                "Purchase Of PPE",
+                "Capital Expenditures",
+            ], d)
+            row["Capex"] = abs(raw_capex) if not np.isnan(raw_capex) else np.nan
+
+            # ── EBITDA ───────────────────────────────────────────────────────
+            if not np.isnan(row["EBIT"]) and not np.isnan(row["DA"]):
+                row["EBITDA"] = row["EBIT"] + abs(row["DA"])
+            else:
+                row["EBITDA"] = _get(fin, ["EBITDA", "Normalized EBITDA"], d)
+
+            # ── BALANÇO ───────────────────────────────────────────────────
+            total_debt = _get(bs, [
+                "Total Debt",
+                "Long Term Debt And Capital Lease Obligation",
+            ], d)
+            st_debt = _get(bs, [
+                "Current Debt",
+                "Short Long Term Debt",
+                "Current Portion Of Long Term Debt",
+            ], d)
+            cash = _get(bs, [
+                "Cash And Cash Equivalents",
+                "Cash Cash Equivalents And Short Term Investments",
+                "Cash And Short Term Investments",
+            ], d)
+            if np.isnan(cash):
+                cash = 0.0
+            if np.isnan(total_debt):
+                total_debt = (st_debt if not np.isnan(st_debt) else 0.0)
+
+            row["Cash"] = cash
+            row["GrossDebt"] = total_debt
+            row["NetDebt"] = total_debt - cash
+
+            # ── NWC (Capital de Giro Líquido) ─────────────────────────────
+            curr_a = _get(bs, ["Current Assets", "Total Current Assets"], d)
+            curr_l = _get(bs, ["Current Liabilities", "Total Current Liabilities"], d)
+            st_d_safe = st_debt if not np.isnan(st_debt) else 0.0
+            if not np.isnan(curr_a) and not np.isnan(curr_l):
+                row["NWC"] = (curr_a - cash) - (curr_l - st_d_safe)
+            else:
+                row["NWC"] = np.nan
+
+            rows.append(row)
+
+        df = (
+            pd.DataFrame(rows)
+            .sort_values("Date")
+            .reset_index(drop=True)
+        )
+        df["Delta_NWC"] = df["NWC"].diff().fillna(0.0)
+        df["Leverage"] = df["NetDebt"] / df["EBITDA"].replace(0, np.nan)
+        return df
+
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Erro ao extrair trimestres: {exc}")
+        return pd.DataFrame()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MÓDULO 2 — MOTOR DCF
+# ──────────────────────────────────────────────────────────────────────────────
+
+def calc_fcff(
+    ebit: float,
+    tax_rate: float,
+    da: float,
+    capex: float,
+    delta_nwc: float,
+) -> float:
+    """FCFF = EBIT × (1 – t) + D&A – CapEx – ΔNWC"""
+    return ebit * (1 - tax_rate) + da - capex - delta_nwc
+
+
+def calc_fcfe(
+    net_income: float,
+    da: float,
+    capex: float,
+    delta_nwc: float,
+    net_borrowing: float = 0.0,
+) -> float:
+    """FCFE = Lucro Líquido + D&A – CapEx – ΔNWC + Net Borrowing"""
+    return net_income + da - capex - delta_nwc + net_borrowing
+
+
+def gordon_tv(terminal_fcf: float, wacc: float, g: float) -> float:
+    """TV = FCF_{t+1} / (WACC – g)  —  Fórmula de Gordon."""
+    if wacc <= g:
+        raise ValueError(
+            f"WACC ({wacc:.2%}) deve ser maior que g ({g:.2%}) para calcular o Valor Terminal."
+        )
+    return terminal_fcf / (wacc - g)
+
+
+def project_fcfs(
+    base_revenue: float,
+    base_da: float,
+    base_capex: float,
+    base_nwc: float,
+    tax_rate: float,
+    revenue_growth_rates: List[float],
+    ebitda_margin_path: List[float],
+    capex_pct_revenue: float,
+    da_growth_pa: float,
+    nwc_pct_revenue: float,
+    is_fcfe: bool = False,
+    net_income_margin_path: Optional[List[float]] = None,
+    net_borrowing: float = 0.0,
+) -> List[float]:
+    """
+    Projeta FCFs (FCFF ou FCFE) para os anos explícitos.
+
+    Parâmetros
+    ----------
+    base_revenue          : Receita base anualizada (R$)
+    base_da               : D&A base anualizado (R$)
+    base_capex            : Capex base anualizado (R$) — não utilizado diretamente
+    base_nwc              : NWC atual (R$) — ponto de partida do capital de giro
+    tax_rate              : Alíquota efetiva de IR+CSLL
+    revenue_growth_rates  : Taxa de crescimento da receita por ano [list]
+    ebitda_margin_path    : Margem EBITDA por ano [list]
+    capex_pct_revenue     : Capex como % da receita (constante)
+    da_growth_pa          : Crescimento anual do D&A (constante)
+    nwc_pct_revenue       : NWC como % da receita (constante)
+    is_fcfe               : True → calcula FCFE; False → FCFF
+    net_income_margin_path: Margem líquida por ano (apenas FCFE)
+    net_borrowing         : Captação líquida anual (apenas FCFE)
+    """
+    fcf_list: List[float] = []
+    revenue = base_revenue
+    nwc_prev = base_nwc
+
+    for i, g_rev in enumerate(revenue_growth_rates):
+        revenue *= (1 + g_rev)
+        ebitda = revenue * ebitda_margin_path[i]
+        da = base_da * ((1 + da_growth_pa) ** (i + 1))
+        ebit = ebitda - da
+        capex = revenue * capex_pct_revenue
+        nwc = revenue * nwc_pct_revenue
+        delta_nwc = nwc - nwc_prev
+        nwc_prev = nwc
+
+        if is_fcfe and net_income_margin_path:
+            net_income = revenue * net_income_margin_path[i]
+            fcf = calc_fcfe(net_income, da, capex, delta_nwc, net_borrowing)
+        else:
+            fcf = calc_fcff(ebit, tax_rate, da, capex, delta_nwc)
+
+        fcf_list.append(fcf)
+
+    return fcf_list
+
+
+def dcf_engine(
+    fcf_projections: List[float],
+    wacc: float,
+    g: float,
+    net_debt: float,
+    shares: float,
+    is_fcfe: bool = False,
+) -> Dict[str, float]:
+    """
+    Motor DCF completo.
+
+    Retorna
+    -------
+    dict com: PV_FCF, PV_TV, TV, Enterprise_Value, Equity_Value, Fair_Price
+    """
+    n = len(fcf_projections)
+
+    # Valor presente dos fluxos explícitos
+    pv_fcf = sum(
+        cf / (1 + wacc) ** (t + 1)
+        for t, cf in enumerate(fcf_projections)
+    )
+
+    # Valor Terminal (Gordon Growth)
+    terminal_fcf = fcf_projections[-1] * (1 + g) if fcf_projections else 0.0
+    tv = gordon_tv(terminal_fcf, wacc, g)
+    pv_tv = tv / (1 + wacc) ** n
+
+    if is_fcfe:
+        equity_value = pv_fcf + pv_tv
+        enterprise_value = equity_value + net_debt
+    else:
+        enterprise_value = pv_fcf + pv_tv
+        equity_value = enterprise_value - net_debt
+
+    fair_price = equity_value / shares if (shares and shares > 0) else np.nan
+
     return {
-        'Retorno Total': total_ret,
-        'CAGR': cagr,
-        'Volatilidade': vol_ann,
-        'Sharpe': sharpe,
-        'Sortino': sortino,
-        'Calmar': calmar,
-        'Max Drawdown': max_dd,
-        'Ulcer Index': ulcer_index
+        "PV_FCF": pv_fcf,
+        "PV_TV": pv_tv,
+        "TV": tv,
+        "Enterprise_Value": enterprise_value,
+        "Equity_Value": equity_value,
+        "Fair_Price": fair_price,
     }
 
-# ==============================================================================
-# MÓDULO 4: SIMULAÇÃO MONTE CARLO
-# ==============================================================================
 
-def run_monte_carlo(initial_balance, monthly_contrib, mu_annual, sigma_annual, years, simulations=1000):
-    if np.isnan(mu_annual) or np.isnan(sigma_annual):
-        return pd.DataFrame()
-        
-    months = int(years * 12)
-    dt = 1/12
-    drift = (mu_annual - 0.5 * sigma_annual**2) * dt
-    
-    if sigma_annual == 0: sigma_annual = 0.01
-        
-    shock = sigma_annual * np.sqrt(dt) * np.random.normal(0, 1, (months, simulations))
-    monthly_returns = np.exp(drift + shock) - 1
-    
-    portfolio_paths = np.zeros((months + 1, simulations))
-    portfolio_paths[0] = initial_balance
-    
-    for t in range(1, months + 1):
-        portfolio_paths[t] = portfolio_paths[t-1] * (1 + monthly_returns[t-1]) + monthly_contrib
-        
-    percentiles = np.percentile(portfolio_paths, [5, 50, 95], axis=1)
-    dates = [datetime.now() + timedelta(days=30*i) for i in range(months + 1)]
-    
-    return pd.DataFrame({
-        'Pessimista (5%)': percentiles[0],
-        'Base (50%)': percentiles[1],
-        'Otimista (95%)': percentiles[2]
-    }, index=dates)
+def calc_irr(
+    current_price: float,
+    fcf_projections: List[float],
+    g: float,
+    net_debt: float,
+    shares: float,
+    is_fcfe: bool = False,
+) -> float:
+    """
+    TIR implícita: taxa que iguala o preço atual ao Equity Value
+    calculado pelo DCF via método de Brent (scipy).
+    """
+    n = len(fcf_projections)
 
-# ==============================================================================
-# MÓDULO 5: BACKTEST & ENGINE
-# ==============================================================================
-
-def construct_portfolio(ranked_df: pd.DataFrame, prices: pd.DataFrame, top_n: int, vol_target: bool = False):
-    """Constrói pesos."""
-    selected = ranked_df.head(top_n).index.tolist()
-    if not selected: return pd.Series()
-
-    if vol_target:
-        valid_sel = [s for s in selected if s in prices.columns]
-        if not valid_sel: return pd.Series()
-        
-        recent_rets = prices[valid_sel].pct_change().tail(63) 
-        vols = recent_rets.std() * (252**0.5)
-        vols = vols.replace(0, 1e-6)
-        raw_weights_inv = 1 / vols
-        
-        if raw_weights_inv.sum() == 0:
-            weights = pd.Series(1.0/len(valid_sel), index=valid_sel)
+    def _equity_at_rate(r: float) -> float:
+        pv = sum(cf / (1 + r) ** (t + 1) for t, cf in enumerate(fcf_projections))
+        tv = fcf_projections[-1] * (1 + g) / (r - g) if r > g else 0.0
+        pv_tv = tv / (1 + r) ** n
+        if is_fcfe:
+            eq_val = pv + pv_tv
         else:
-            weights = raw_weights_inv / raw_weights_inv.sum() 
+            eq_val = pv + pv_tv - net_debt
+        return eq_val / shares if shares > 0 else np.nan
+
+    def _obj(r: float) -> float:
+        return _equity_at_rate(r) - current_price
+
+    try:
+        return brentq(_obj, g + 1e-4, 0.80, xtol=1e-6, maxiter=300)
+    except Exception:
+        return np.nan
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MÓDULO 3 — ANÁLISE DE SENSIBILIDADE
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_sensitivity(
+    base_revenue: float,
+    base_da: float,
+    base_nwc: float,
+    tax_rate: float,
+    revenue_growth_rates: List[float],
+    capex_pct: float,
+    da_growth: float,
+    nwc_pct: float,
+    net_debt: float,
+    shares: float,
+    wacc_range: np.ndarray,
+    y_range: np.ndarray,
+    y_axis: str,               # "ebitda_margin" | "g"
+    fixed_g: float,
+    fixed_margin: float,
+    current_price: float,
+    is_fcfe: bool = False,
+    base_nim: float = 0.10,
+) -> pd.DataFrame:
+    """
+    Gera matriz de sensibilidade: WACC (eixo X) × Margem EBITDA|g (eixo Y).
+    Célula = Margem de Segurança se current_price disponível, senão Preço Justo.
+    """
+    rows: List[List[float]] = []
+
+    for y_val in y_range:
+        row_vals: List[float] = []
+        for w in wacc_range:
+            try:
+                if y_axis == "ebitda_margin":
+                    margin_path = [float(y_val)] * len(revenue_growth_rates)
+                    g = fixed_g
+                else:
+                    margin_path = [fixed_margin] * len(revenue_growth_rates)
+                    g = float(y_val)
+
+                if w <= g + 1e-4:
+                    row_vals.append(np.nan)
+                    continue
+
+                nim_path = [base_nim] * len(revenue_growth_rates) if is_fcfe else None
+
+                fcf_proj = project_fcfs(
+                    base_revenue=base_revenue,
+                    base_da=base_da,
+                    base_capex=0.0,
+                    base_nwc=base_nwc,
+                    tax_rate=tax_rate,
+                    revenue_growth_rates=revenue_growth_rates,
+                    ebitda_margin_path=margin_path,
+                    capex_pct_revenue=capex_pct,
+                    da_growth_pa=da_growth,
+                    nwc_pct_revenue=nwc_pct,
+                    is_fcfe=is_fcfe,
+                    net_income_margin_path=nim_path,
+                )
+
+                res = dcf_engine(fcf_proj, w, g, net_debt, shares, is_fcfe)
+                fp = res["Fair_Price"]
+
+                if (
+                    not np.isnan(current_price)
+                    and current_price > 0
+                    and not np.isnan(fp)
+                ):
+                    cell = (fp - current_price) / current_price
+                else:
+                    cell = fp
+
+                row_vals.append(round(cell, 4) if not np.isnan(cell) else np.nan)
+
+            except Exception:
+                row_vals.append(np.nan)
+
+        rows.append(row_vals)
+
+    return pd.DataFrame(
+        rows,
+        index=np.round(y_range, 4),
+        columns=np.round(wacc_range, 4),
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MÓDULO 4 — GRÁFICOS PLOTLY
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _dark_layout(**kwargs) -> Dict[str, Any]:
+    """Layout base dark theme para todos os gráficos."""
+    base = dict(
+        plot_bgcolor=CHART_BG,
+        paper_bgcolor=CHART_PAPER,
+        font=dict(color=CHART_FONT, size=12),
+        margin=dict(t=60, b=40, l=60, r=40),
+    )
+    base.update(kwargs)
+    return base
+
+
+def chart_leverage(df: pd.DataFrame) -> go.Figure:
+    """Barras de Alavancagem (ND/EBITDA) com limiares de atenção."""
+    fig = go.Figure()
+    if df.empty or "Leverage" not in df.columns:
+        return fig
+
+    df_p = df.dropna(subset=["Leverage"]).copy()
+    df_p["DateStr"] = df_p["Date"].dt.strftime("%Y-%m")
+    colors = df_p["Leverage"].apply(
+        lambda x: "#EF4444" if x > 3.5 else ("#F59E0B" if x > 2.5 else "#22C55E")
+    )
+
+    fig.add_trace(go.Bar(
+        x=df_p["DateStr"],
+        y=df_p["Leverage"],
+        marker_color=colors,
+        text=df_p["Leverage"].round(2),
+        textposition="outside",
+        name="ND/EBITDA",
+    ))
+    fig.add_hline(y=2.5, line_dash="dash", line_color="#F59E0B",
+                  annotation_text="Atenção (2,5x)", annotation_position="top left")
+    fig.add_hline(y=3.5, line_dash="dash", line_color="#EF4444",
+                  annotation_text="Crítico (3,5x)", annotation_position="top left")
+
+    fig.update_layout(
+        title="📊 Evolução da Alavancagem — Dívida Líquida / EBITDA",
+        xaxis_title="Trimestre",
+        yaxis_title="ND/EBITDA (x)",
+        showlegend=False,
+        **_dark_layout(),
+    )
+    return fig
+
+
+def chart_capex_da(df: pd.DataFrame) -> go.Figure:
+    """Barras agrupadas Capex vs D&A + linha Capex/D&A."""
+    fig = go.Figure()
+    if df.empty or "Capex" not in df.columns:
+        return fig
+
+    df_p = df.dropna(subset=["Capex", "DA"], how="all").copy()
+    df_p["DateStr"] = df_p["Date"].dt.strftime("%Y-%m")
+    cap_bi = df_p["Capex"] / 1e9
+    da_bi = df_p["DA"].abs() / 1e9
+
+    fig.add_trace(go.Bar(x=df_p["DateStr"], y=cap_bi,
+                         name="Capex", marker_color="#3B82F6", opacity=0.85))
+    fig.add_trace(go.Bar(x=df_p["DateStr"], y=da_bi,
+                         name="D&A", marker_color="#8B5CF6", opacity=0.85))
+
+    ratio = (cap_bi / da_bi.replace(0, np.nan)).round(2)
+    fig.add_trace(go.Scatter(
+        x=df_p["DateStr"], y=ratio,
+        name="Capex/D&A (x)", yaxis="y2",
+        line=dict(color="#F59E0B", width=2, dash="dot"),
+        mode="lines+markers",
+    ))
+
+    fig.update_layout(
+        title="🔧 Capex Executado vs D&A (R$ Bilhões)",
+        barmode="group",
+        xaxis_title="Trimestre",
+        yaxis_title="R$ Bilhões",
+        yaxis2=dict(title="Capex/D&A (x)", overlaying="y", side="right",
+                    showgrid=False),
+        legend=dict(orientation="h", y=1.12),
+        **_dark_layout(),
+    )
+    return fig
+
+
+def chart_waterfall(result: Dict[str, float], net_debt: float, label: str) -> go.Figure:
+    """Waterfall: PV FCFs → PV TV → EV → (−) ND → Equity."""
+    pv_fcf = result.get("PV_FCF", 0) / 1e9
+    pv_tv = result.get("PV_TV", 0) / 1e9
+    ev = result.get("Enterprise_Value", 0) / 1e9
+    nd = net_debt / 1e9
+    eq = result.get("Equity_Value", 0) / 1e9
+
+    fig = go.Figure(go.Waterfall(
+        orientation="v",
+        measure=["relative", "relative", "total", "relative", "total"],
+        x=["PV FCFs Explícitos", "PV Valor Terminal",
+           "Enterprise Value", "(−) Dívida Líquida", "Equity Value"],
+        y=[pv_fcf, pv_tv, 0, -nd, 0],
+        connector={"line": {"color": "#334155"}},
+        increasing={"marker": {"color": "#22C55E"}},
+        decreasing={"marker": {"color": "#EF4444"}},
+        totals={"marker": {"color": "#3B82F6"}},
+        text=[f"R${v:.1f}Bi" for v in [pv_fcf, pv_tv, ev, -nd, eq]],
+        textposition="outside",
+    ))
+    fig.update_layout(
+        title=f"🌊 Waterfall DCF — {label}",
+        yaxis_title="R$ Bilhões",
+        **_dark_layout(),
+    )
+    return fig
+
+
+def chart_fcf_projection(
+    fcf_cons: List[float],
+    fcf_mod: List[float],
+    years: int,
+) -> go.Figure:
+    """Barras agrupadas da projeção de FCF por cenário."""
+    xlabels = [f"Ano {i + 1}" for i in range(years)]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=xlabels,
+        y=[v / 1e9 for v in fcf_cons],
+        name="🐢 Conservador",
+        marker_color="#EF4444",
+        opacity=0.85,
+    ))
+    fig.add_trace(go.Bar(
+        x=xlabels,
+        y=[v / 1e9 for v in fcf_mod],
+        name="🚀 Moderado",
+        marker_color="#22C55E",
+        opacity=0.85,
+    ))
+    fig.update_layout(
+        title="📈 FCF Projetado por Cenário (R$ Bilhões)",
+        barmode="group",
+        xaxis_title="Ano de Projeção",
+        yaxis_title="FCF (R$ Bi)",
+        legend=dict(orientation="h", y=1.12),
+        **_dark_layout(),
+    )
+    return fig
+
+
+def chart_heatmap(
+    df_sens: pd.DataFrame,
+    y_label: str,
+    current_price: float,
+) -> go.Figure:
+    """Heatmap de Margem de Segurança: WACC (X) × Variável Y."""
+    is_mos = not np.isnan(current_price) and current_price > 0
+    z = df_sens.values.astype(float)
+
+    colorscale = [
+        [0.00, "#7F1D1D"],
+        [0.35, "#DC2626"],
+        [0.48, "#F59E0B"],
+        [0.52, "#FAFAFA"],
+        [0.65, "#22C55E"],
+        [1.00, "#14532D"],
+    ] if is_mos else "RdYlGn"
+
+    if is_mos:
+        text_m = [[f"{v:.1%}" if not np.isnan(v) else "N/D" for v in row] for row in z]
+        cb_title = "Margem de Seg."
+        zmid = 0.0
     else:
-        weights = pd.Series(1.0/len(selected), index=selected)
-    return weights.sort_values(ascending=False)
+        text_m = [[f"R${v:.2f}" if not np.isnan(v) else "N/D" for v in row] for row in z]
+        cb_title = "Preço Justo (R$)"
+        zmid = None
 
-def run_dca_backtest_robust(all_prices: pd.DataFrame, top_n: int, dca_amount: float, use_vol_target: bool, start_date: datetime, end_date: datetime):
-    """Backtest Robusto."""
-    all_prices = all_prices.ffill()
-    dca_start = start_date + timedelta(days=30)
-    
-    market_calendar = pd.Series(all_prices.index, index=all_prices.index)
-    dates_series = market_calendar.loc[dca_start:end_date].resample('MS').first()
-    dates = dates_series.dropna().tolist()
+    fig = go.Figure(data=go.Heatmap(
+        z=z,
+        x=[f"{v:.1%}" for v in df_sens.columns],
+        y=[f"{v:.1%}" for v in df_sens.index],
+        colorscale=colorscale,
+        zmid=zmid,
+        text=text_m,
+        texttemplate="%{text}",
+        textfont={"size": 10},
+        colorbar=dict(title=cb_title),
+        hoverongaps=False,
+    ))
 
-    if not dates or len(dates) < 2:
-        return pd.DataFrame(), pd.DataFrame(), {}
+    if is_mos:
+        fig.add_annotation(
+            text="🟢 Verde = Margem de Segurança Positiva  |  🔴 Vermelho = Ativo Sobreavaliado",
+            xref="paper", yref="paper",
+            x=0.5, y=-0.14,
+            showarrow=False,
+            font=dict(color="#94A3B8", size=11),
+        )
 
-    portfolio_value = pd.Series(0.0, index=all_prices.index)
-    portfolio_holdings = {} 
-    monthly_transactions = []
-    cash = 0.0 
+    fig.update_layout(
+        title=f"🔥 Sensibilidade: WACC × {y_label}",
+        xaxis_title="WACC",
+        yaxis_title=y_label,
+        height=500,
+        **_dark_layout(),
+    )
+    return fig
 
-    for i, month_start in enumerate(dates):
-        # 1. Definição das janelas
-        eval_date = month_start - timedelta(days=1)
-        mom_start = month_start - timedelta(days=365*3) 
-        
-        prices_historical = all_prices.loc[:eval_date]
-        prices_window = prices_historical.loc[mom_start:]
-        
-        if prices_window.empty: continue
 
-        # 2. Screening
-        res_mom = compute_residual_momentum_enhanced(prices_window, lookback=12, skip=1)
-        
-        if res_mom.empty:
-            continue
-            
-        df_rank = pd.DataFrame(index=res_mom.index)
-        df_rank['Score'] = robust_zscore(res_mom)
-        df_rank = df_rank.sort_values('Score', ascending=False)
-        
-        # 3. Pesos
-        risk_window = prices_historical.tail(90)
-        target_weights = construct_portfolio(df_rank, risk_window, top_n, use_vol_target)
-        
-        # 4. Execução
+# ──────────────────────────────────────────────────────────────────────────────
+# MÓDULO 5 — SIDEBAR
+# ──────────────────────────────────────────────────────────────────────────────
+
+def render_sidebar() -> Dict[str, Any]:
+    """Sidebar: seleção de ticker e tipo de empresa."""
+    with st.sidebar:
+        st.markdown("## 📊 ValuationB3")
+        st.markdown("*DCF Engine para o Mercado Brasileiro*")
+        st.divider()
+
+        st.markdown("### 🎯 Ativo")
+        ticker_raw = st.text_input(
+            "Ticker (sem .SA)",
+            value="WEGE3",
+            help="Ex: PETR4, VALE3, ITUB4, RADL3, RENT3",
+        ).upper().strip()
+
+        is_financial = st.toggle(
+            "🏦 Instituição Financeira",
+            value=False,
+            help="Bancos e seguradoras usam FCFE. Empresas reais usam FCFF.",
+        )
+
+        if is_financial:
+            st.info("**Modo FCFE** ativado — adequado para bancos, seguradoras e fintechs.")
+        else:
+            st.info("**Modo FCFF** ativado — adequado para empresas do setor real.")
+
+        st.divider()
+        load_btn = st.button(
+            "🔄 Carregar Dados do Ativo",
+            type="primary",
+            use_container_width=True,
+        )
+
+        st.divider()
+        st.caption(
+            "Fontes: yfinance, Banco Central do Brasil (SGS).\n"
+            "Os dados trimestrais cobrem até 12 trimestres históricos."
+        )
+
+    return {
+        "ticker_raw": ticker_raw,
+        "ticker_yf": f"{ticker_raw}.SA",
+        "is_financial": is_financial,
+        "load_btn": load_btn,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MÓDULO 6 — ABA 1: DIAGNÓSTICO
+# ──────────────────────────────────────────────────────────────────────────────
+
+def render_diagnostico() -> None:
+    """Aba 1 — Diagnóstico do Cenário Atual."""
+    st.header("🔬 Diagnóstico do Cenário Atual")
+    ticker_yf: str = st.session_state["ticker_yf"]
+
+    # ── Macroeconômico (BCB/SGS) ──────────────────────────────────────────
+    with st.spinner("Consultando Banco Central (SGS/BCB)..."):
+        macro = fetch_macro()
+        st.session_state["macro"] = macro
+
+    st.subheader("🏛️ Indicadores Macroeconômicos (BCB)")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("📈 IPCA 12m", f"{macro['ipca_12m']:.2%}")
+    m2.metric("💰 CDI Anual", f"{macro['cdi_anual']:.2%}")
+    m3.metric("🏛️ Meta SELIC", f"{macro['selic']:.2%}")
+    m4.metric("🌱 PIB Nominal Est.", f"{macro['pib_nominal']:.2%}")
+
+    st.divider()
+
+    # ── Dados Trimestrais ─────────────────────────────────────────────────
+    st.subheader(f"📋 Histórico Trimestral — {ticker_yf}")
+
+    df_q: pd.DataFrame = st.session_state["quarterly_df"]
+
+    # Fallback: upload CSV do RI
+    st.markdown("##### 📂 Fallback — Upload de Dados do RI (opcional)")
+    uploaded = st.file_uploader(
+        "CSV com colunas: Date, Revenue, EBIT, EBITDA, DA, Capex, NetDebt, NWC",
+        type=["csv"],
+        key="ri_upload",
+    )
+    if uploaded is not None:
         try:
-            if month_start not in all_prices.index:
-                next_days = all_prices.index[all_prices.index > month_start]
-                if next_days.empty: break
-                exec_date = next_days[0]
-            else:
-                exec_date = month_start
-                
-            current_date_prices = all_prices.loc[exec_date]
-        except KeyError:
-            continue
+            df_ri = pd.read_csv(uploaded)
+            df_ri["Date"] = pd.to_datetime(df_ri["Date"])
+            df_ri = df_ri.sort_values("Date").reset_index(drop=True)
+            df_ri["Delta_NWC"] = df_ri["NWC"].diff().fillna(0.0)
+            df_ri["Leverage"] = df_ri["NetDebt"] / df_ri["EBITDA"].replace(0, np.nan)
+            df_q = df_ri
+            st.session_state["quarterly_df"] = df_q
+            st.success("✅ Dados do RI carregados com sucesso!")
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Erro ao processar arquivo: {exc}")
 
-        current_portfolio_val_mtm = cash
-        for t, qtd in portfolio_holdings.items():
-            if t in current_date_prices and not np.isnan(current_date_prices[t]):
-                current_portfolio_val_mtm += qtd * current_date_prices[t]
-        
-        total_portfolio_val = current_portfolio_val_mtm + dca_amount
-        
-        new_holdings = {}
-        
-        for ticker, weight in target_weights.items():
-            if ticker in current_date_prices and not np.isnan(current_date_prices[ticker]):
-                price = current_date_prices[ticker]
-                if price > 0:
-                    alloc_val = total_portfolio_val * weight
-                    qty = alloc_val / price
-                    new_holdings[ticker] = qty
-                    
-                    monthly_transactions.append({
-                        'Date': exec_date,
-                        'Ticker': ticker,
-                        'Action': 'Rebalance/Buy',
-                        'Price': price,
-                        'Weight': weight
-                    })
-        
-        portfolio_holdings = new_holdings
-        
-        # 5. MTM
-        next_rebalance = dates[i+1] if i < len(dates)-1 else end_date
-        valid_end = min(next_rebalance, all_prices.index[-1])
-        
-        if exec_date > valid_end: continue
-            
-        valuation_dates = all_prices.loc[exec_date:valid_end].index
-        
-        for d in valuation_dates:
-            val = 0
-            for t, q in portfolio_holdings.items():
-                p = all_prices.at[d, t]
-                if not np.isnan(p):
-                    val += q * p
-            portfolio_value[d] = val
+    if df_q.empty:
+        st.warning(
+            "⚠️ Dados trimestrais não disponíveis. "
+            "Faça upload via RI ou verifique se o ticker possui histórico no Yahoo Finance."
+        )
+        return
 
-    portfolio_value = portfolio_value[portfolio_value > 0].sort_index()
-    equity_curve = pd.DataFrame({'Strategy_DCA': portfolio_value})
-    transactions_df = pd.DataFrame(monthly_transactions)
-    final_holdings = portfolio_holdings 
+    # Persiste últimos valores para as abas seguintes
+    last = df_q.iloc[-1]
 
-    return equity_curve, transactions_df, final_holdings
+    def _safe(v: Any) -> float:
+        return float(v) if pd.notna(v) else np.nan
 
-def run_benchmark_dca(price_series: pd.Series, dates: list, dca_amount: float):
-    """Simula DCA Benchmark."""
-    if price_series.empty:
-        return pd.Series()
-    
-    price_series = price_series.dropna()
-    
-    df_flow = pd.DataFrame(index=price_series.index)
-    df_flow['Price'] = price_series
-    df_flow['Units'] = 0.0
-    
-    sorted_dates = sorted(dates)
-    
-    for d in sorted_dates:
-        idx_loc = price_series.index.asof(d)
-        if idx_loc is not None:
-            price = price_series.loc[idx_loc]
-            if price > 0:
-                buy_units = dca_amount / price
-                if idx_loc in df_flow.index:
-                    df_flow.at[idx_loc, 'Add_Units'] = buy_units
+    st.session_state["last_ebitda"] = _safe(last.get("EBITDA"))
+    st.session_state["last_ebit"] = _safe(last.get("EBIT"))
+    st.session_state["last_revenue"] = _safe(last.get("Revenue"))
+    st.session_state["last_da"] = abs(_safe(last.get("DA")) or 0)
+    st.session_state["last_capex"] = abs(_safe(last.get("Capex")) or 0)
+    st.session_state["net_debt_ss"] = _safe(last.get("NetDebt", 0))
+    st.session_state["last_nwc"] = _safe(last.get("NWC")) or 0.0
 
-    df_flow['Add_Units'] = df_flow.get('Add_Units', pd.Series(0, index=df_flow.index)).fillna(0)
-    df_flow['Cumulative_Units'] = df_flow['Add_Units'].cumsum()
-    
-    equity_curve = df_flow['Cumulative_Units'] * df_flow['Price']
-    
-    return equity_curve[equity_curve > 0]
+    # ── LTM (Last Twelve Months) ──────────────────────────────────────────
+    def _ltm_sum(col: str) -> float:
+        if col in df_q.columns:
+            return df_q[col].tail(4).sum()
+        return np.nan
 
-# ==============================================================================
-# APP PRINCIPAL
-# ==============================================================================
+    st.markdown("##### 📊 LTM — Últimos 12 Meses (soma dos 4 últimos trimestres)")
+    l1, l2, l3, l4, l5 = st.columns(5)
+    ltm_rev = _ltm_sum("Revenue")
+    ltm_ebitda = _ltm_sum("EBITDA")
+    ltm_capex = _ltm_sum("Capex")
+    ltm_da = abs(_ltm_sum("DA"))
+    nd_cur = st.session_state["net_debt_ss"]
 
-def main():
-    st.title("🧪 Quant Factor Lab: Pro v3.7 (Full Hybrid)")
-    st.markdown("""
-    **Otimização Multifator Institucional**
-    * **Motor Híbrido:** Prioriza API Brapi.dev, mas usa Yahoo Finance para preencher dados faltantes (P/VP, ROE).
-    * **Aviso:** O carregamento inicial pode demorar devido ao sistema de redundância.
-    """)
+    def _bi(v: float) -> str:
+        return f"R$ {v / 1e9:.2f} Bi" if not np.isnan(v) else "N/D"
 
-    st.sidebar.header("1. Universo e Dados")
-    default_univ = "ITUB3, TOTS3, MDIA3, TAEE3, BBSE3, WEGE3, PSSA3, EGIE3, B3SA3, VIVT3, AGRO3, PRIO3, BBAS3, BPAC11, SBSP3, SAPR4, CMIG3, UNIP6, FRAS3, CPFE3"
-    ticker_input = st.sidebar.text_area("Tickers (Brapi Format - Sem .SA)", default_univ, height=100)
-    raw_tickers = [t.strip().upper() for t in ticker_input.split(',') if t.strip()]
-    yf_tickers = [f"{t}.SA" for t in raw_tickers]
-    
-    st.sidebar.header("2. Pesos (Ranking Atual)")
-    w_rm = st.sidebar.slider("Residual Momentum", 0.0, 1.0, 0.40)
-    w_val = st.sidebar.slider("Value (P/L, P/VP, EBITDA)", 0.0, 1.0, 0.40)
-    w_qual = st.sidebar.slider("Quality (ROE, Margem)", 0.0, 1.0, 0.20)
+    l1.metric("Receita LTM", _bi(ltm_rev))
+    l2.metric("EBITDA LTM", _bi(ltm_ebitda))
+    l3.metric("Capex LTM", _bi(ltm_capex))
+    l4.metric("D&A LTM", _bi(ltm_da))
+    l5.metric(
+        "Dívida Líquida",
+        _bi(nd_cur),
+        delta="Positiva (Endividada)" if not np.isnan(nd_cur) and nd_cur > 0 else "Caixa Líquido",
+        delta_color="inverse" if not np.isnan(nd_cur) and nd_cur > 0 else "normal",
+    )
 
-    st.sidebar.header("3. Parâmetros de Gestão")
-    top_n = st.sidebar.number_input("Número de Ativos", 4, 30, 10)
-    use_vol_target = st.sidebar.checkbox("Risk Parity (Inv Vol)", True)
-    
-    st.sidebar.markdown("---")
-    st.sidebar.header("4. Backtest & Monte Carlo")
-    dca_amount = st.sidebar.number_input("Aporte Mensal (R$)", 100, 100000, 2000)
-    dca_years = st.sidebar.slider("Anos de Histórico", 2, 10, 5)
-    mc_years = st.sidebar.slider("Projeção Futura (Anos)", 1, 20, 5)
-    
-    run_btn = st.sidebar.button("🚀 Executar Análise Institucional", type="primary")
+    # ── Gráficos ──────────────────────────────────────────────────────────
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.plotly_chart(chart_leverage(df_q), use_container_width=True)
+    with col_b:
+        st.plotly_chart(chart_capex_da(df_q), use_container_width=True)
+
+    # ── Tabela detalhada ──────────────────────────────────────────────────
+    with st.expander("📋 Ver tabela trimestral completa"):
+        cols_show = [c for c in
+                     ["Date", "Revenue", "EBITDA", "EBIT", "DA",
+                      "Capex", "NetDebt", "Leverage", "NWC"]
+                     if c in df_q.columns]
+        df_disp = df_q[cols_show].copy()
+        for col in ["Revenue", "EBITDA", "EBIT", "DA", "Capex", "NetDebt", "NWC"]:
+            if col in df_disp.columns:
+                df_disp[col] = df_disp[col] / 1e9
+        fmt = {
+            "Revenue": "R$ {:.2f}Bi", "EBITDA": "R$ {:.2f}Bi",
+            "EBIT": "R$ {:.2f}Bi", "DA": "R$ {:.2f}Bi",
+            "Capex": "R$ {:.2f}Bi", "NetDebt": "R$ {:.2f}Bi",
+            "NWC": "R$ {:.2f}Bi", "Leverage": "{:.2f}x",
+        }
+        st.dataframe(
+            df_disp.style.format({k: v for k, v in fmt.items() if k in df_disp.columns}),
+            use_container_width=True,
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MÓDULO 7 — ABA 2: PREMISSAS
+# ──────────────────────────────────────────────────────────────────────────────
+
+def render_premissas(is_financial: bool) -> Dict[str, Any]:
+    """Aba 2 — Formulário de Premissas para os dois cenários."""
+    st.header("⚙️ Premissas de Projeção")
+
+    macro: Dict[str, float] = st.session_state.get("macro", {})
+    ipca = macro.get("ipca_12m", FALLBACK_IPCA)
+    cdi = macro.get("cdi_anual", FALLBACK_CDI)
+    pib_nom = macro.get("pib_nominal", FALLBACK_PIB_NOMINAL)
+
+    # Valores base do session_state (preenchidos pela Aba 1)
+    last_rev = st.session_state.get("last_revenue", np.nan)
+    last_ebitda = st.session_state.get("last_ebitda", np.nan)
+    last_da = st.session_state.get("last_da", np.nan)
+    last_capex = st.session_state.get("last_capex", np.nan)
+    last_nwc = st.session_state.get("last_nwc", 0.0)
+
+    # Defaults calculados a partir do último trimestre
+    safe_rev = last_rev if (not np.isnan(last_rev) and last_rev > 0) else 1e10
+    safe_ebitda = last_ebitda if (not np.isnan(last_ebitda) and last_ebitda > 0) else 2.5e9
+    safe_da = last_da if (not np.isnan(last_da) and last_da > 0) else 5e8
+    safe_capex = last_capex if (not np.isnan(last_capex) and last_capex > 0) else 6e8
+
+    # Anualizados (× 4 para fluxos de resultado; NWC é saldo, não anualizar)
+    ann_rev = safe_rev * 4
+    ann_ebitda = safe_ebitda * 4
+    ann_da = safe_da * 4
+    ann_capex = safe_capex * 4
+
+    base_margin = ann_ebitda / ann_rev
+    base_capex_pct = ann_capex / ann_rev
+    base_nim = (ann_ebitda * 0.50) / ann_rev   # proxy lucro líquido
+
+    st.info(
+        f"📌 **Base (último trimestre anualizado)** | "
+        f"Receita: R$ {ann_rev/1e9:.2f}Bi | "
+        f"Margem EBITDA: {base_margin:.1%} | "
+        f"Capex/Receita: {base_capex_pct:.1%}"
+    )
+
+    # ── Parâmetros Gerais ─────────────────────────────────────────────────
+    st.markdown("### 🔧 Parâmetros Gerais")
+    cg1, cg2, cg3 = st.columns(3)
+    with cg1:
+        tax_rate = st.number_input(
+            "Alíquota IR + CSLL (%)",
+            min_value=0.0, max_value=50.0,
+            value=34.0, step=0.5,
+            key="tax_rate",
+        ) / 100
+    with cg2:
+        years = st.selectbox(
+            "Período Explícito (anos)",
+            [3, 5, 7],
+            index=0,
+            key="proj_years",
+        )
+    with cg3:
+        da_growth = st.number_input(
+            "Crescimento D&A (% a.a.)",
+            min_value=0.0, max_value=20.0,
+            value=round(ipca * 100, 1),
+            step=0.5,
+            key="da_growth",
+        ) / 100
+
+    if is_financial:
+        net_borrowing = st.number_input(
+            "Net Borrowing Anual (R$ Milhões) — somente FCFE",
+            value=0.0,
+            step=100.0,
+            help="Captação líquida de dívida: nova dívida − amortizações",
+        ) * 1e6
+    else:
+        net_borrowing = 0.0
+
+    st.divider()
+
+    # ── Dois cenários lado a lado ─────────────────────────────────────────
+    col_c, col_m = st.columns(2, gap="large")
+
+    # ─── Cenário Conservador ───────────────────────────────────────────────
+    with col_c:
+        st.markdown(
+            "### 🐢 Cenário Conservador",
+            help="Crescimento limitado ao IPCA, margens pressionadas, WACC estressado",
+        )
+        st.caption("Macro adverso | Sem ganhos de eficiência | Custo de capital elevado")
+
+        cons_rev_g: List[float] = []
+        for y in range(years):
+            v = st.number_input(
+                f"Crescimento Receita Ano {y + 1} (%)",
+                min_value=-20.0, max_value=50.0,
+                value=round(ipca * 100, 1),
+                step=0.5,
+                key=f"c_rev_{y}",
+            ) / 100
+            cons_rev_g.append(v)
+
+        cons_margin = st.slider(
+            "Margem EBITDA (%)",
+            min_value=3.0, max_value=60.0,
+            value=round(max(base_margin * 0.88, 0.08) * 100, 1),
+            step=0.5,
+            key="c_margin",
+        ) / 100
+
+        cons_capex_pct = st.slider(
+            "Capex / Receita (%)",
+            min_value=0.0, max_value=30.0,
+            value=round(min(base_capex_pct * 1.10, 20.0), 1),
+            step=0.5,
+            key="c_capex",
+        ) / 100
+
+        cons_nwc_pct = st.slider(
+            "NWC / Receita (%)",
+            min_value=-10.0, max_value=30.0,
+            value=5.0,
+            step=0.5,
+            key="c_nwc",
+        ) / 100
+
+        cons_wacc = st.slider(
+            "WACC Estressado (%)",
+            min_value=5.0, max_value=30.0,
+            value=round(min(cdi * 100 + 5.0, 20.0), 1),
+            step=0.25,
+            key="c_wacc",
+        ) / 100
+
+        if is_financial:
+            cons_nim = st.slider(
+                "Margem Líquida (%)",
+                min_value=1.0, max_value=40.0,
+                value=round(max(base_nim * 0.85 * 100, 5.0), 1),
+                step=0.5,
+                key="c_nim",
+            ) / 100
+        else:
+            cons_nim = base_nim
+
+    # ─── Cenário Moderado ──────────────────────────────────────────────────
+    with col_m:
+        st.markdown(
+            "### 🚀 Cenário Moderado",
+            help="Crescimento real baseado em pipeline, margens sustentadas, WACC histórico",
+        )
+        st.caption("Crescimento real | Eficiência mantida | Custo de capital histórico")
+
+        mod_rev_g: List[float] = []
+        for y in range(years):
+            v = st.number_input(
+                f"Crescimento Receita Ano {y + 1} (%)",
+                min_value=-20.0, max_value=80.0,
+                value=round(min((ipca + 0.04) * 100, 25.0), 1),
+                step=0.5,
+                key=f"m_rev_{y}",
+            ) / 100
+            mod_rev_g.append(v)
+
+        mod_margin = st.slider(
+            "Margem EBITDA (%)",
+            min_value=3.0, max_value=70.0,
+            value=round(base_margin * 100, 1),
+            step=0.5,
+            key="m_margin",
+        ) / 100
+
+        mod_capex_pct = st.slider(
+            "Capex / Receita (%)",
+            min_value=0.0, max_value=30.0,
+            value=round(base_capex_pct * 100, 1),
+            step=0.5,
+            key="m_capex",
+        ) / 100
+
+        mod_nwc_pct = st.slider(
+            "NWC / Receita (%)",
+            min_value=-10.0, max_value=30.0,
+            value=5.0,
+            step=0.5,
+            key="m_nwc",
+        ) / 100
+
+        mod_wacc = st.slider(
+            "WACC Médio Histórico (%)",
+            min_value=5.0, max_value=25.0,
+            value=round(min(cdi * 100 + 3.0, 16.0), 1),
+            step=0.25,
+            key="m_wacc",
+        ) / 100
+
+        if is_financial:
+            mod_nim = st.slider(
+                "Margem Líquida (%)",
+                min_value=1.0, max_value=40.0,
+                value=round(base_nim * 100, 1),
+                step=0.5,
+                key="m_nim",
+            ) / 100
+        else:
+            mod_nim = base_nim
+
+    # ── Taxa g na Perpetuidade ─────────────────────────────────────────────
+    st.divider()
+    st.markdown("### 🌱 Crescimento na Perpetuidade (g)")
+    g_max = round(pib_nom * 100, 2)
+    g_default = round(min(ipca * 100 + 0.5, g_max), 2)
+
+    g_val = st.slider(
+        f"Taxa g — máximo travado no PIB Nominal estimado ({g_max:.1f}%)",
+        min_value=0.5,
+        max_value=float(g_max),
+        value=float(g_default),
+        step=0.25,
+        help=(
+            f"A taxa de crescimento na perpetuidade não pode exceder o PIB Nominal "
+            f"estimado ({g_max:.1f}%), conforme boas práticas de valuation."
+        ),
+    ) / 100
+
+    return {
+        "years": int(years),
+        "tax_rate": tax_rate,
+        "da_growth": da_growth,
+        "g": g_val,
+        "ann_rev": ann_rev,
+        "ann_da": ann_da,
+        "base_margin": base_margin,
+        "base_nim": base_nim,
+        "last_nwc": last_nwc,
+        "net_borrowing": net_borrowing,
+        # Conservador
+        "cons_rev_g": cons_rev_g,
+        "cons_margin": cons_margin,
+        "cons_capex_pct": cons_capex_pct,
+        "cons_nwc_pct": cons_nwc_pct,
+        "cons_wacc": cons_wacc,
+        "cons_nim": cons_nim,
+        # Moderado
+        "mod_rev_g": mod_rev_g,
+        "mod_margin": mod_margin,
+        "mod_capex_pct": mod_capex_pct,
+        "mod_nwc_pct": mod_nwc_pct,
+        "mod_wacc": mod_wacc,
+        "mod_nim": mod_nim,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MÓDULO 8 — ABA 3: MOTOR DCF
+# ──────────────────────────────────────────────────────────────────────────────
+
+def render_motor_dcf(is_financial: bool) -> None:
+    """Aba 3 — Motor de Fluxo de Caixa Descontado."""
+    st.header("⚡ Motor de Fluxo de Caixa Descontado")
+
+    p: Dict[str, Any] = st.session_state.get("premissas_inputs", {})
+    if not p:
+        st.info("👈 Defina as premissas na Aba 2 primeiro.")
+        return
+
+    net_debt = st.session_state.get("net_debt_ss", 0.0) or 0.0
+    shares = st.session_state.get("shares_outstanding", np.nan)
+
+    if np.isnan(shares) or shares <= 0:
+        st.error(
+            "❌ Número de ações não disponível. "
+            "Verifique se o ticker foi carregado corretamente."
+        )
+        return
+
+    mode = "🏦 FCFE (Instituição Financeira)" if is_financial else "🏭 FCFF (Empresa Real)"
+    st.info(f"**Modo de cálculo:** {mode}")
+
+    # Fórmula exibida
+    if is_financial:
+        st.latex(
+            r"\text{FCFE} = \text{Lucro Líquido} + D\&A - CapEx - \Delta NWC + \text{Net Borrowing}"
+        )
+    else:
+        st.latex(
+            r"\text{FCFF} = EBIT \times (1 - t) + D\&A - CapEx - \Delta NWC"
+        )
+    st.latex(
+        r"TV = \frac{FCF_{t+1}}{WACC - g} \quad \text{(Gordon Growth)}"
+    )
+
+    st.divider()
+
+    # ── Projeção dos FCFs ─────────────────────────────────────────────────
+    nim_cons = [p["cons_nim"]] * p["years"] if is_financial else None
+    nim_mod = [p["mod_nim"]] * p["years"] if is_financial else None
+
+    fcf_cons = project_fcfs(
+        base_revenue=p["ann_rev"],
+        base_da=p["ann_da"],
+        base_capex=0.0,
+        base_nwc=p["last_nwc"],
+        tax_rate=p["tax_rate"],
+        revenue_growth_rates=p["cons_rev_g"],
+        ebitda_margin_path=[p["cons_margin"]] * p["years"],
+        capex_pct_revenue=p["cons_capex_pct"],
+        da_growth_pa=p["da_growth"],
+        nwc_pct_revenue=p["cons_nwc_pct"],
+        is_fcfe=is_financial,
+        net_income_margin_path=nim_cons,
+        net_borrowing=p["net_borrowing"],
+    )
+
+    fcf_mod = project_fcfs(
+        base_revenue=p["ann_rev"],
+        base_da=p["ann_da"],
+        base_capex=0.0,
+        base_nwc=p["last_nwc"],
+        tax_rate=p["tax_rate"],
+        revenue_growth_rates=p["mod_rev_g"],
+        ebitda_margin_path=[p["mod_margin"]] * p["years"],
+        capex_pct_revenue=p["mod_capex_pct"],
+        da_growth_pa=p["da_growth"],
+        nwc_pct_revenue=p["mod_nwc_pct"],
+        is_fcfe=is_financial,
+        net_income_margin_path=nim_mod,
+        net_borrowing=p["net_borrowing"],
+    )
+
+    # ── DCF Engine ────────────────────────────────────────────────────────
+    errors: List[str] = []
+    result_cons: Dict[str, float] = {}
+    result_mod: Dict[str, float] = {}
+
+    try:
+        result_cons = dcf_engine(fcf_cons, p["cons_wacc"], p["g"],
+                                 net_debt, shares, is_financial)
+    except ValueError as exc:
+        errors.append(f"❌ DCF Conservador: {exc}")
+
+    try:
+        result_mod = dcf_engine(fcf_mod, p["mod_wacc"], p["g"],
+                                net_debt, shares, is_financial)
+    except ValueError as exc:
+        errors.append(f"❌ DCF Moderado: {exc}")
+
+    for err in errors:
+        st.error(err)
+    if errors:
+        return
+
+    # Persiste resultados
+    st.session_state["dcf_results"] = {
+        "conservador": result_cons,
+        "moderado": result_mod,
+        "premissas": p,
+        "is_financial": is_financial,
+        "net_debt": net_debt,
+        "shares": shares,
+        "fcf_cons": fcf_cons,
+        "fcf_mod": fcf_mod,
+    }
+
+    # ── Gráfico de projeção ───────────────────────────────────────────────
+    st.plotly_chart(chart_fcf_projection(fcf_cons, fcf_mod, p["years"]),
+                    use_container_width=True)
+
+    # ── Waterfall ─────────────────────────────────────────────────────────
+    c1, c2 = st.columns(2)
+    with c1:
+        st.plotly_chart(
+            chart_waterfall(result_cons, net_debt, "🐢 Conservador"),
+            use_container_width=True,
+        )
+    with c2:
+        st.plotly_chart(
+            chart_waterfall(result_mod, net_debt, "🚀 Moderado"),
+            use_container_width=True,
+        )
+
+    # ── Tabela detalhada ──────────────────────────────────────────────────
+    with st.expander("📊 Detalhamento dos FCFs Projetados (R$ Bilhões)"):
+        year_cols = {f"Ano {i + 1}": [
+            fcf_cons[i] / 1e9, fcf_mod[i] / 1e9
+        ] for i in range(p["years"])}
+        df_det = pd.DataFrame({
+            "Cenário": ["🐢 Conservador", "🚀 Moderado"],
+            **year_cols,
+            "Σ PV FCFs": [result_cons["PV_FCF"] / 1e9, result_mod["PV_FCF"] / 1e9],
+            "PV TV": [result_cons["PV_TV"] / 1e9, result_mod["PV_TV"] / 1e9],
+            "Equity Value": [
+                result_cons["Equity_Value"] / 1e9,
+                result_mod["Equity_Value"] / 1e9,
+            ],
+            "Preço Justo (R$)": [
+                result_cons["Fair_Price"],
+                result_mod["Fair_Price"],
+            ],
+        }).set_index("Cenário")
+        st.dataframe(
+            df_det.style.format({
+                **{c: "{:.2f} Bi" for c in df_det.columns if c != "Preço Justo (R$)"},
+                "Preço Justo (R$)": "R$ {:.2f}",
+            }),
+            use_container_width=True,
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MÓDULO 9 — ABA 4: OUTPUT & DECISÃO
+# ──────────────────────────────────────────────────────────────────────────────
+
+def render_output() -> None:
+    """Aba 4 — Output Financeiro e Decisão de Investimento."""
+    st.header("💡 Output Financeiro e Decisão de Investimento")
+
+    dcf = st.session_state.get("dcf_results", {})
+    if not dcf:
+        st.info("👈 Execute o DCF na Aba 3 primeiro.")
+        return
+
+    result_cons: Dict[str, float] = dcf["conservador"]
+    result_mod: Dict[str, float] = dcf["moderado"]
+    p: Dict[str, Any] = dcf["premissas"]
+    is_financial: bool = dcf["is_financial"]
+    net_debt: float = dcf["net_debt"]
+    shares: float = dcf["shares"]
+    fcf_cons: List[float] = dcf["fcf_cons"]
+    fcf_mod: List[float] = dcf["fcf_mod"]
+    cdi: float = st.session_state.get("macro", {}).get("cdi_anual", FALLBACK_CDI)
+
+    fp_cons = result_cons.get("Fair_Price", np.nan)
+    fp_mod = result_mod.get("Fair_Price", np.nan)
+    px_atual = st.session_state.get("current_price", np.nan)
+
+    # ── Métricas principais ───────────────────────────────────────────────
+    st.subheader("📌 Preço Justo vs Preço de Tela")
+    col1, col2, col3, col4 = st.columns(4)
+
+    col1.metric(
+        "🐢 Preço Justo Conservador",
+        f"R$ {fp_cons:.2f}" if not np.isnan(fp_cons) else "N/D",
+    )
+    col2.metric(
+        "🚀 Preço Justo Moderado",
+        f"R$ {fp_mod:.2f}" if not np.isnan(fp_mod) else "N/D",
+    )
+    col3.metric(
+        "📌 Preço de Tela Atual",
+        f"R$ {px_atual:.2f}" if not np.isnan(px_atual) else "N/D",
+    )
+
+    ms_pct: float = np.nan
+    if not np.isnan(fp_mod) and not np.isnan(px_atual) and px_atual > 0:
+        ms_pct = (fp_mod - px_atual) / px_atual
+        col4.metric(
+            "🛡️ Margem de Segurança",
+            f"{ms_pct:.1%}",
+            delta="Subavaliado ✅" if ms_pct > 0 else "Sobreavaliado ❌",
+            delta_color="normal" if ms_pct > 0 else "inverse",
+        )
+    else:
+        col4.metric("🛡️ Margem de Segurança", "N/D")
+
+    st.divider()
+
+    # ── TIR Implícita ─────────────────────────────────────────────────────
+    st.subheader("📐 TIR Implícita da Compra ao Preço Atual")
+    st.caption(
+        "Taxa Interna de Retorno que o investidor obteria comprando hoje "
+        "e realizando ao Preço Justo do modelo."
+    )
+
+    if not np.isnan(px_atual) and px_atual > 0 and shares > 0:
+        ti1, ti2 = st.columns(2)
+        for col_ui, fcf_list, wacc_used, label in [
+            (ti1, fcf_cons, p["cons_wacc"], "🐢 Conservador"),
+            (ti2, fcf_mod, p["mod_wacc"], "🚀 Moderado"),
+        ]:
+            try:
+                irr = calc_irr(
+                    current_price=px_atual,
+                    fcf_projections=fcf_list,
+                    g=p["g"],
+                    net_debt=net_debt,
+                    shares=shares,
+                    is_fcfe=is_financial,
+                )
+                spread = irr - cdi if not np.isnan(irr) else np.nan
+                col_ui.metric(
+                    f"TIR — {label}",
+                    f"{irr:.2%}" if not np.isnan(irr) else "N/D",
+                    delta=f"Spread vs CDI: {spread:.2%}" if not np.isnan(spread) else None,
+                    delta_color="normal" if (not np.isnan(spread) and spread > 0) else "inverse",
+                )
+            except Exception as exc:
+                col_ui.metric(f"TIR — {label}", "Erro")
+                col_ui.caption(str(exc))
+    else:
+        st.warning("Preço atual não disponível para cálculo da TIR.")
+
+    st.divider()
+
+    # ── Painel de Decisão ─────────────────────────────────────────────────
+    st.subheader("🎯 Painel de Decisão")
+
+    if not np.isnan(ms_pct) and not np.isnan(px_atual):
+        fp_medio = (
+            (fp_cons + fp_mod) / 2
+            if (not np.isnan(fp_cons) and not np.isnan(fp_mod))
+            else fp_mod
+        )
+
+        if ms_pct > 0.25:
+            verdict = "🟢 COMPRA FORTE"
+            subtext = f"Margem de Segurança confortável de {ms_pct:.1%} (>25%)"
+            bg = "#14532D"
+        elif 0.10 < ms_pct <= 0.25:
+            verdict = "🟡 COMPRA MODERADA"
+            subtext = f"Ativo levemente subavaliado — Margem de {ms_pct:.1%}"
+            bg = "#713F12"
+        elif 0.0 < ms_pct <= 0.10:
+            verdict = "⚪ NEUTRO / ACUMULAR"
+            subtext = f"Preço próximo do valor justo (+{ms_pct:.1%})"
+            bg = "#1E3A5F"
+        elif -0.10 <= ms_pct <= 0.0:
+            verdict = "🟠 NEUTRO / AGUARDAR"
+            subtext = f"Ativo levemente sobreavaliado ({ms_pct:.1%})"
+            bg = "#7C2D12"
+        else:
+            verdict = "🔴 EVITAR / REDUZIR"
+            subtext = f"Ativo significativamente sobreavaliado ({ms_pct:.1%})"
+            bg = "#7F1D1D"
+
+        st.markdown(
+            f"""
+            <div style="
+                background:{bg};
+                padding:24px 32px;
+                border-radius:14px;
+                text-align:center;
+                margin:8px 0;
+            ">
+                <h2 style="color:#FFFFFF;margin:0;letter-spacing:1px">{verdict}</h2>
+                <p style="color:#D1D5DB;margin:10px 0 0;font-size:1rem">{subtext}</p>
+                <p style="color:#94A3B8;margin:6px 0 0;font-size:.9rem">
+                    Preço Atual: <b>R$ {px_atual:.2f}</b> &nbsp;|&nbsp;
+                    Preço Justo (Moderado): <b>R$ {fp_mod:.2f}</b> &nbsp;|&nbsp;
+                    Preço Justo Médio: <b>R$ {fp_medio:.2f}</b>
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.warning("Defina o preço atual e os resultados do DCF para ver o painel de decisão.")
+
+    # ── Resumo completo ───────────────────────────────────────────────────
+    with st.expander("📋 Resumo Completo do Modelo de Valuation"):
+        def _fbi(v: float) -> str:
+            return f"R$ {v/1e9:.2f} Bi" if not np.isnan(v) else "N/D"
+
+        rows_summary = {
+            "Parâmetro": [
+                "WACC", "Taxa g",
+                "PV FCFs Explícitos", "PV Valor Terminal",
+                "Enterprise Value", "(−) Dívida Líquida",
+                "Equity Value", "Preço Justo",
+            ],
+            "🐢 Conservador": [
+                f"{p['cons_wacc']:.2%}", f"{p['g']:.2%}",
+                _fbi(result_cons["PV_FCF"]), _fbi(result_cons["PV_TV"]),
+                _fbi(result_cons["Enterprise_Value"]), _fbi(net_debt),
+                _fbi(result_cons["Equity_Value"]),
+                f"R$ {fp_cons:.2f}" if not np.isnan(fp_cons) else "N/D",
+            ],
+            "🚀 Moderado": [
+                f"{p['mod_wacc']:.2%}", f"{p['g']:.2%}",
+                _fbi(result_mod["PV_FCF"]), _fbi(result_mod["PV_TV"]),
+                _fbi(result_mod["Enterprise_Value"]), _fbi(net_debt),
+                _fbi(result_mod["Equity_Value"]),
+                f"R$ {fp_mod:.2f}" if not np.isnan(fp_mod) else "N/D",
+            ],
+        }
+        st.dataframe(
+            pd.DataFrame(rows_summary).set_index("Parâmetro"),
+            use_container_width=True,
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MÓDULO 10 — ABA 5: SENSIBILIDADE
+# ──────────────────────────────────────────────────────────────────────────────
+
+def render_sensibilidade() -> None:
+    """Aba 5 — Estresse de Modelo / Análise de Sensibilidade."""
+    st.header("🎲 Estresse de Modelo — Análise de Sensibilidade")
+
+    dcf = st.session_state.get("dcf_results", {})
+    if not dcf:
+        st.info("👈 Execute o DCF nas Abas 2–3 primeiro.")
+        return
+
+    p: Dict[str, Any] = dcf["premissas"]
+    is_financial: bool = dcf["is_financial"]
+    net_debt: float = dcf["net_debt"]
+    shares: float = dcf["shares"]
+    px_atual: float = st.session_state.get("current_price", np.nan)
+    macro: Dict[str, float] = st.session_state.get("macro", {})
+    pib_nom: float = macro.get("pib_nominal", FALLBACK_PIB_NOMINAL)
+
+    st.markdown(
+        "Varie o **WACC** (eixo X) e escolha a variável do **eixo Y** "
+        "(Margem EBITDA ou Taxa g) para mapear onde o ativo perde "
+        "a margem de segurança."
+    )
+
+    # ── Configurações da Matriz ───────────────────────────────────────────
+    cf1, cf2 = st.columns(2)
+    with cf1:
+        wacc_min = st.number_input("WACC Mínimo (%)", 5.0, 20.0, 8.0, 0.5) / 100
+        wacc_max = st.number_input("WACC Máximo (%)", 8.0, 30.0, 20.0, 0.5) / 100
+        wacc_steps = st.slider("Pontos no WACC", 3, 10, 7)
+    with cf2:
+        y_mode = st.radio(
+            "Variável no Eixo Y",
+            ["Margem EBITDA", "Taxa g (Perpetuidade)"],
+            horizontal=True,
+            key="y_mode",
+        )
+        if y_mode == "Margem EBITDA":
+            y_min = st.slider("Margem EBITDA Mín (%)", 3.0, 25.0, 8.0, 1.0) / 100
+            y_max = st.slider("Margem EBITDA Máx (%)", 10.0, 60.0, 45.0, 1.0) / 100
+            y_steps = st.slider("Pontos na Margem", 3, 10, 7)
+            y_range = np.linspace(y_min, y_max, y_steps)
+            y_label = "Margem EBITDA"
+            y_axis_key = "ebitda_margin"
+            fixed_g = p["g"]
+            fixed_margin = p["mod_margin"]
+        else:
+            y_min_g = st.slider("g Mínimo (%)", 0.5, 4.0, 1.0, 0.25) / 100
+            y_max_g = st.slider(
+                f"g Máximo (% — PIB Nominal: {pib_nom:.1%})",
+                2.0,
+                round(pib_nom * 100, 1),
+                round(pib_nom * 100, 1),
+                0.25,
+            ) / 100
+            y_steps = st.slider("Pontos em g", 3, 9, 6)
+            y_range = np.linspace(y_min_g, y_max_g, y_steps)
+            y_label = "Taxa g"
+            y_axis_key = "g"
+            fixed_g = p["g"]
+            fixed_margin = p["mod_margin"]
+
+    wacc_range = np.linspace(wacc_min, wacc_max, wacc_steps)
+
+    st.divider()
+    run_btn = st.button("🔥 Calcular Matriz de Sensibilidade", type="primary")
 
     if run_btn:
-        if not raw_tickers:
-            st.error("Insira pelo menos um ticker.")
-            return
-
-        with st.status("Processando Pipeline Quantitativo...", expanded=True) as status:
-            end_date = datetime.now()
-            start_date_total = end_date - timedelta(days=365 * (dca_years + 3)) 
-            start_date_backtest = end_date - timedelta(days=365 * dca_years)
-
-            # 1. Dados de Preço
-            status.write("📥 Baixando Histórico de Preços (YFinance)...")
-            prices = fetch_price_data(yf_tickers, start_date_total, end_date)
-            
-            if prices.empty:
-                st.error("Falha ao baixar preços.")
-                status.update(label="Erro", state="error")
-                return
-
-            # 2. Dados Fundamentais (HÍBRIDO)
-            status.write("🔍 Consultando Fundamentos (Híbrido: Brapi + Yahoo Fallback)...")
-            fundamentals = fetch_fundamentals_hybrid(raw_tickers, BRAPI_TOKEN)
-            
-            if not fundamentals.empty:
-                status.write(f"✅ Fundamentos carregados para {len(fundamentals)} ativos.")
-            else:
-                status.write("⚠️ Atenção: Falha crítica nos fundamentos. Usando apenas Momentum.")
-
-            # 3. Cálculo do RANKING ATUAL
-            status.write("🧮 Calculando Scores Atuais...")
-            curr_mom = compute_residual_momentum_enhanced(prices)
-            
-            if not fundamentals.empty:
-                curr_val = compute_value_robust(fundamentals)
-                curr_qual = compute_quality_score(fundamentals)
-            else:
-                curr_val = pd.Series(0, index=prices.columns)
-                curr_qual = pd.Series(0, index=prices.columns)
-
-            df_master = pd.DataFrame(index=prices.columns)
-            df_master['Res_Mom'] = curr_mom
-            df_master['Value'] = curr_val
-            df_master['Quality'] = curr_qual
-            
-            if not fundamentals.empty and 'sector' in fundamentals.columns:
-                df_master['Sector'] = fundamentals['sector']
-                
-            df_master.dropna(thresh=1, inplace=True)
-
-            cols_map = {'Res_Mom': w_rm, 'Value': w_val, 'Quality': w_qual}
-            df_master['Composite_Score'] = 0.0
-            
-            for col, weight in cols_map.items():
-                if col in df_master.columns:
-                    z = robust_zscore(df_master[col])
-                    df_master[f'{col}_Z'] = z
-                    df_master['Composite_Score'] += z * weight
-            
-            df_master = df_master.sort_values('Composite_Score', ascending=False)
-
-            # 4. Execução do BACKTEST
-            status.write("⚙️ Rodando Backtest Robusto...")
-            dca_curve, dca_transactions, dca_holdings = run_dca_backtest_robust(
-                prices, top_n, dca_amount, use_vol_target, start_date_backtest, end_date
+        with st.spinner("Calculando heatmap de sensibilidade..."):
+            df_sens = build_sensitivity(
+                base_revenue=p["ann_rev"],
+                base_da=p["ann_da"],
+                base_nwc=p["last_nwc"],
+                tax_rate=p["tax_rate"],
+                revenue_growth_rates=p["mod_rev_g"],
+                capex_pct=p["mod_capex_pct"],
+                da_growth=p["da_growth"],
+                nwc_pct=p["mod_nwc_pct"],
+                net_debt=net_debt,
+                shares=shares,
+                wacc_range=wacc_range,
+                y_range=y_range,
+                y_axis=y_axis_key,
+                fixed_g=fixed_g,
+                fixed_margin=fixed_margin,
+                current_price=px_atual,
+                is_fcfe=is_financial,
+                base_nim=p["base_nim"],
             )
 
-            status.update(label="Análise Concluída!", state="complete", expanded=False)
+        st.plotly_chart(
+            chart_heatmap(df_sens, y_label, px_atual),
+            use_container_width=True,
+        )
 
-        # ==============================================================================
-        # DASHBOARD & BENCHMARKS (RESTAURADO)
-        # ==============================================================================
-        
-        bench_curves = {}
-        if not dca_transactions.empty:
-            dca_dates = sorted(list(set(pd.to_datetime(dca_transactions['Date']).tolist())))
-        else:
-            dca_dates = []
+        # Contagem de quadrantes
+        total_cells = df_sens.size
+        not_nan = df_sens.notna().sum().sum()
+        is_mos = not np.isnan(px_atual) and px_atual > 0
+        if is_mos:
+            positivos = (df_sens > 0).sum().sum()
+            pct_safe = positivos / not_nan if not_nan > 0 else 0
+            st.info(
+                f"✅ **{positivos}/{not_nan}** combinações ({pct_safe:.0%}) "
+                f"oferecem margem de segurança positiva ao preço atual."
+            )
 
-        if dca_dates:
-            for bench_ticker in ['BOVA11.SA', 'DIVO11.SA']:
-                if bench_ticker in prices.columns:
-                    bench_curve = run_benchmark_dca(prices[bench_ticker], dca_dates, dca_amount)
-                    common_idx = dca_curve.index.intersection(bench_curve.index)
-                    if not common_idx.empty:
-                        bench_curves[bench_ticker] = bench_curve.loc[common_idx]
+        with st.expander("📊 Ver dados da matriz"):
+            is_mos2 = not np.isnan(px_atual) and px_atual > 0
+            fmt_dict = {
+                c: "{:.1%}" if is_mos2 else "R$ {:.2f}"
+                for c in df_sens.columns
+            }
+            styled = df_sens.style.format(fmt_dict).background_gradient(
+                cmap="RdYlGn", axis=None, vmin=-0.3, vmax=0.3 if is_mos2 else None
+            )
+            st.dataframe(styled, use_container_width=True)
 
-        tab1, tab2, tab6, tab3, tab4, tab5 = st.tabs([
-            "🏆 Ranking Atual", 
-            "📈 Performance DCA", 
-            "🆚 Comparativo Benchmarks",
-            "💰 Histórico & Custódia",
-            "🔮 Monte Carlo", 
-            "📋 Dados Brutos"
-        ])
+        st.markdown("""
+        **📖 Como interpretar o heatmap:**
+        - **🟢 Verde** — O preço justo supera o preço atual: há margem de segurança.
+        - **🔴 Vermelho** — O ativo perde a margem de segurança nessas premissas.
+        - Use o heatmap para entender a **robustez** da tese de investimento a variações macro e operacionais.
+        """)
 
-        with tab1:
-            st.subheader("🎯 Carteira Recomendada (Hoje)")
-            
-            top_picks = df_master.head(top_n).copy()
-            latest_prices = prices.iloc[-1]
-            top_picks['Preço Atual'] = latest_prices.reindex(top_picks.index)
-            
-            risk_window = prices.tail(90)
-            sug_weights = construct_portfolio(top_picks, risk_window, top_n, use_vol_target)
-            
-            top_picks['Peso (%)'] = (sug_weights * 100)
-            top_picks['Alocação (R$)'] = (sug_weights * dca_amount)
-            top_picks['Qtd Sugerida'] = (top_picks['Alocação (R$)'] / top_picks['Preço Atual'])
-            
-            cols_show = ['Sector', 'Preço Atual', 'Composite_Score', 'Peso (%)', 'Alocação (R$)', 'Qtd Sugerida', 'Value', 'Quality']
-            cols_final = [c for c in cols_show if c in top_picks.columns]
-            
-            display_df = top_picks[cols_final].style.format({
-                'Preço Atual': 'R$ {:.2f}',
-                'Composite_Score': '{:.2f}',
-                'Value': '{:.2f}',
-                'Quality': '{:.2f}',
-                'Peso (%)': '{:.1f}%',
-                'Alocação (R$)': 'R$ {:.0f}',
-                'Qtd Sugerida': '{:.0f}'
-            }).background_gradient(subset=['Composite_Score'], cmap='Greens')
-            
-            st.dataframe(display_df, use_container_width=True, height=400)
-            
-            col_chart1, col_chart2 = st.columns(2)
-            with col_chart1:
-                st.plotly_chart(px.pie(values=sug_weights, names=sug_weights.index, title="Alocação Sugerida"), use_container_width=True)
-            with col_chart2:
-                if 'Sector' in top_picks.columns:
-                    st.plotly_chart(px.pie(top_picks, names='Sector', values='Peso (%)', title="Exposição Setorial"), use_container_width=True)
 
-        with tab2:
-            st.subheader("Simulação de Acumulação (DCA)")
-            if not dca_curve.empty:
-                end_val = dca_curve.iloc[-1,0]
-                unique_months = pd.to_datetime(dca_transactions['Date']).dt.to_period('M').nunique()
-                total_invested_real = unique_months * dca_amount
-                
-                profit = end_val - total_invested_real
-                roi = (profit / total_invested_real) if total_invested_real > 0 else 0
-                
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Patrimônio Final", f"R$ {end_val:,.2f}")
-                m2.metric("Total Investido", f"R$ {total_invested_real:,.2f}")
-                m3.metric("Lucro Líquido", f"R$ {profit:,.2f}", delta=f"{roi:.1%}")
-                
-                fig = px.line(dca_curve, title="Curva de Patrimônio (Estratégia)")
-                st.plotly_chart(fig, use_container_width=True)
-                
-                st.markdown("### Análise de Risco")
-                metrics = calculate_advanced_metrics(dca_curve['Strategy_DCA'])
-                st.json(metrics)
+# ──────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ──────────────────────────────────────────────────────────────────────────────
 
-        with tab6:
-            st.subheader("🆚 Estratégia vs Benchmarks")
-            if not dca_curve.empty and bench_curves:
-                df_compare = dca_curve.copy()
-                for b_name, b_series in bench_curves.items():
-                    df_compare[b_name] = b_series
-                
-                df_compare = df_compare.ffill().dropna()
-                fig_comp = px.line(df_compare, title="Evolução Patrimonial Comparativa")
-                st.plotly_chart(fig_comp, use_container_width=True)
-                
-                comp_metrics = []
-                m_strat = calculate_advanced_metrics(df_compare['Strategy_DCA'])
-                m_strat['Asset'] = '🚀 Estratégia'
-                m_strat['Saldo Final'] = df_compare['Strategy_DCA'].iloc[-1]
-                comp_metrics.append(m_strat)
-                
-                for b_name in bench_curves.keys():
-                    if b_name in df_compare.columns:
-                        m_bench = calculate_advanced_metrics(df_compare[b_name])
-                        m_bench['Asset'] = b_name
-                        m_bench['Saldo Final'] = df_compare[b_name].iloc[-1]
-                        comp_metrics.append(m_bench)
-                
-                df_comp_metrics = pd.DataFrame(comp_metrics).set_index('Asset')
-                cols_order = ['Saldo Final', 'Retorno Total', 'CAGR', 'Volatilidade', 'Sharpe', 'Max Drawdown']
-                
-                st.dataframe(
-                    df_comp_metrics[cols_order].style.format({
-                        'Saldo Final': 'R$ {:,.2f}',
-                        'Retorno Total': '{:.1%}',
-                        'CAGR': '{:.1%}',
-                        'Volatilidade': '{:.1%}',
-                        'Sharpe': '{:.2f}',
-                        'Max Drawdown': '{:.1%}'
-                    }).highlight_max(subset=['Saldo Final'], color='#d4edda'),
-                    use_container_width=True
-                )
+def main() -> None:
+    """Ponto de entrada principal do aplicativo ValuationB3."""
+    _init_state()
+
+    sidebar = render_sidebar()
+    ticker_yf: str = sidebar["ticker_yf"]
+    is_financial: bool = sidebar["is_financial"]
+
+    # ── Header ────────────────────────────────────────────────────────────
+    col_h, col_p = st.columns([5, 1])
+    with col_h:
+        st.title(f"📊 ValuationB3 — DCF Engine")
+        st.caption(
+            f"Motor de Valuation Fundamentalista para o Mercado Brasileiro (B3)  |  "
+            f"Ativo selecionado: **{sidebar['ticker_raw']}**"
+        )
+
+    # ── Carregamento do ativo ─────────────────────────────────────────────
+    if sidebar["load_btn"]:
+        _reset_state()
+        st.session_state["ticker_yf"] = ticker_yf
+
+        with st.status(f"Carregando {ticker_yf}...", expanded=True) as status:
+            status.write("📡 Consultando yfinance...")
+            info = fetch_info(ticker_yf)
+
+            if not info:
+                st.error(f"❌ Ticker '{ticker_yf}' não encontrado.")
+                status.update(label="Erro", state="error")
+                st.stop()
+
+            px = (
+                info.get("currentPrice")
+                or info.get("regularMarketPrice")
+                or info.get("previousClose")
+            )
+            sh = (
+                info.get("sharesOutstanding")
+                or info.get("impliedSharesOutstanding")
+            )
+
+            st.session_state["current_price"] = float(px) if px else np.nan
+            st.session_state["shares_outstanding"] = float(sh) if sh else np.nan
+            st.session_state["ticker_loaded"] = True
+
+            status.write("📊 Extraindo dados financeiros trimestrais...")
+            df_q = fetch_quarterly(ticker_yf)
+            st.session_state["quarterly_df"] = df_q
+
+            if not df_q.empty:
+                last = df_q.iloc[-1]
+
+                def _s(v: Any) -> float:
+                    return float(v) if pd.notna(v) else np.nan
+
+                st.session_state["last_ebitda"] = _s(last.get("EBITDA"))
+                st.session_state["last_ebit"] = _s(last.get("EBIT"))
+                st.session_state["last_revenue"] = _s(last.get("Revenue"))
+                st.session_state["last_da"] = abs(_s(last.get("DA")) or 0)
+                st.session_state["last_capex"] = abs(_s(last.get("Capex")) or 0)
+                st.session_state["net_debt_ss"] = _s(last.get("NetDebt", 0))
+                st.session_state["last_nwc"] = _s(last.get("NWC")) or 0.0
+                status.write(f"✅ {len(df_q)} trimestres carregados.")
             else:
-                st.warning("Dados insuficientes para comparação ou período muito curto.")
+                status.write("⚠️ Dados trimestrais não disponíveis — use upload de RI na Aba 1.")
 
-        with tab3:
-            col_h1, col_h2 = st.columns([1, 1])
-            with col_h1:
-                st.subheader("💰 Posição Final (Backtest)")
-                if dca_holdings:
-                    final_df = pd.DataFrame.from_dict(dca_holdings, orient='index', columns=['Qtd'])
-                    last_date_idx = dca_curve.index[-1]
-                    if last_date_idx in prices.index:
-                        last_prices = prices.loc[last_date_idx]
-                        final_df['Preço Fechamento'] = last_prices.reindex(final_df.index)
-                        final_df['Valor Total (R$)'] = final_df['Qtd'] * final_df['Preço Fechamento']
-                        total_nav = final_df['Valor Total (R$)'].sum()
-                        final_df['Peso (%)'] = (final_df['Valor Total (R$)'] / total_nav) * 100
-                        final_df = final_df.sort_values('Peso (%)', ascending=False)
-                        
-                        st.dataframe(final_df.style.format({'Qtd': '{:.0f}', 'Preço Fechamento': 'R$ {:.2f}', 'Valor Total (R$)': 'R$ {:,.2f}', 'Peso (%)': '{:.1f}%'}), use_container_width=True)
-                        st.metric("Patrimônio em Custódia", f"R$ {total_nav:,.2f}")
-                else:
-                    st.info("Nenhuma posição mantida.")
+            nome = info.get("longName", ticker_yf)
+            setor = info.get("sector", "N/D")
+            px_fmt = (
+                f"R$ {st.session_state['current_price']:.2f}"
+                if not np.isnan(st.session_state["current_price"])
+                else "N/D"
+            )
 
-            with col_h2:
-                st.subheader("📊 Alocação Final")
-                if dca_holdings:
-                     st.plotly_chart(px.pie(final_df, values='Valor Total (R$)', names=final_df.index, hole=0.4), use_container_width=True)
+            status.update(
+                label=f"✅ {nome} ({setor}) — Preço Atual: {px_fmt}",
+                state="complete",
+                expanded=False,
+            )
 
-            st.divider()
-            if not dca_transactions.empty:
-                st.subheader("Histórico de Transações")
-                st.dataframe(pd.DataFrame(dca_transactions).sort_values('Date', ascending=False), use_container_width=True)
+    # ── Abas principais ───────────────────────────────────────────────────
+    if not st.session_state.get("ticker_loaded"):
+        st.info(
+            "👈 **Insira o ticker e clique em 'Carregar Dados do Ativo'** na barra lateral "
+            "para iniciar a análise fundamentalista."
+        )
+        st.markdown("""
+        ### Como usar o ValuationB3:
+        1. **Aba 1 — Diagnóstico**: Revise os últimos 12 trimestres, alavancagem e Capex.
+        2. **Aba 2 — Premissas**: Defina crescimento, margens e WACC para dois cenários.
+        3. **Aba 3 — Motor DCF**: Execute o DCF (FCFF ou FCFE) com Gordon Growth.
+        4. **Aba 4 — Output**: Veja o Preço Justo, TIR implícita e Margem de Segurança.
+        5. **Aba 5 — Sensibilidade**: Explore o heatmap WACC × Margem / g.
+        """)
+        return
 
-        with tab4:
-            st.subheader("Projeção Probabilística")
-            if not dca_curve.empty:
-                daily_rets = dca_curve['Strategy_DCA'].pct_change().dropna()
-                if not daily_rets.empty:
-                    mu = daily_rets.mean() * 252
-                    sigma = daily_rets.std() * np.sqrt(252)
-                    sim_df = run_monte_carlo(dca_curve.iloc[-1,0], dca_amount, mu, sigma, mc_years)
-                    if not sim_df.empty:
-                        st.plotly_chart(px.line(sim_df, title=f"Cone de Probabilidade - {mc_years} Anos"), use_container_width=True)
-                    else:
-                        st.warning("Erro ao calcular Monte Carlo (dados insuficientes).")
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "🔬 Diagnóstico",
+        "⚙️ Premissas",
+        "⚡ Motor DCF",
+        "💡 Output & Decisão",
+        "🎲 Sensibilidade",
+    ])
 
-        with tab5:
-            st.subheader("Dados Fundamentais (Brapi + YF)")
-            if not fundamentals.empty:
-                st.dataframe(fundamentals)
-                st.caption("Nota: Dados obtidos via Brapi.dev com fallback automático para Yahoo Finance em caso de lacunas (P/VP, ROE).")
-            else:
-                st.error("Falha na recuperação de fundamentos. Verifique o token ou a conexão.")
+    with tab1:
+        render_diagnostico()
+
+    with tab2:
+        premissas = render_premissas(is_financial)
+        st.session_state["premissas_inputs"] = premissas
+
+    with tab3:
+        render_motor_dcf(is_financial)
+
+    with tab4:
+        render_output()
+
+    with tab5:
+        render_sensibilidade()
+
 
 if __name__ == "__main__":
     main()
